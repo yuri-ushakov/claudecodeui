@@ -171,7 +171,12 @@ one-shot хода stdin открыт и через 5+ с, `canUseTool` дохо�
   resume с осиротевшим агентом без затрат токенов.
 - `npm run typecheck` в upstream/main `dc7cb6c6` падает на
   `src/modules/sidebar/tests/recentConversationTitleSync.test.ts` (тест не передаёт
-  `backgroundSessionIds`) — это ошибка upstream, к патчу отношения не имеет.
+  `backgroundSessionIds`) — это ошибка upstream, к патчу отношения не имеет. **Грабли:** скрипт
+  = `tsc -p tsconfig.json && tsc -p server/tsconfig.json`, и из-за этой ошибки серверная
+  проверка не запускается вовсе; серверные типы (включая тесты — они входят в сборку
+  `build:server`) проверять отдельно: `npx tsc --noEmit -p server/tsconfig.json`. Иначе ошибка
+  всплывёт только в `npm run build`, а тот в `dist-server` ничего не подменит (сборка идёт в
+  `dist-server.next`) — старая сборка остаётся молча.
 
 ## Браузер для агентов (`server/modules/browser-use/`)
 
@@ -225,6 +230,88 @@ one-shot хода stdin открыт и через 5+ с, `canUseTool` дохо�
 скриншот только по запросу). Проба вживую без сервера: `node scripts/hq/browser-launch-probe.mjs`
 (`--online` — плюс `https://httpbin.org/headers`, `--shell` — прежний headless-shell для сравнения;
 нужен собранный `dist-server`).
+
+## Просмотр файлов по ссылке (`/view`, `CLOUDCLI_VIEW_ROOTS`)
+
+Главная сессия штаба пишет в чат путь к отчёту агента — файл `.md` в `hq/reports/` или в
+репозитории другого проекта. Нужно, чтобы он открывался по клику, в том числе с планшета, и не
+только внутри текущего проекта. Два способа открыть, один владелец рендера — `CodeEditor`
+(тот же компонент, что открывает файлы вкладка «Файлы»):
+
+- **(а) внутри приложения** — клик по ссылке `[имя](/abs/path.md)`, по голому абсолютному пути
+  `/home/yuri/…/report.md` в тексте ответа или по такому же пути в обратных кавычках открывает
+  файл в боковой панели редактора, как раньше открывались ссылки на файлы проекта. Новое:
+  голые абсолютные пути на `.md`/`.markdown` (с необязательным `:строка`) становятся ссылками
+  (remark-плагин `remarkAbsoluteMarkdownPaths` в `src/modules/chat/utils/markdownFilePaths.ts`;
+  пути на другие расширения не трогаются — как в upstream, кликабельны только ссылки `[]()`), и
+  **markdown открывается сразу отрендеренным** — кнопка в шапке переключает на исходник (это
+  касается и открытия из «Файлов»: раньше `.md` открывался в CodeMirror, а превью включалось
+  кнопкой; выбор переключателя помнится для открытого файла, следующий файл начинает со своего
+  умолчания).
+- **(б) отдельной вкладкой браузера** — ссылка `[имя](/view?path=/abs/path.md)` рендерится
+  обычной ссылкой с `target=_blank rel=noopener`; страница `/view` (маршрут в `App.tsx`,
+  `src/modules/file-view/FileViewRoute.tsx`) показывает тот же `CodeEditor` на весь экран,
+  без проекта: файл читается через `GET /api/files/view?path=…`, только чтение (кнопки
+  «Сохранить» нет, CodeMirror `readOnly`), markdown — отрендеренный, остальное — исходник
+  моноширинным. Логин — тот же `ProtectedRoute`, что у всего приложения: без токена в
+  `localStorage` показывается форма входа, после входа открывается файл. Относительный href
+  → тот же origin, поэтому ссылка работает и через tail-адрес с планшета. Крестик закрывает
+  вкладку (если её открыл скрипт), иначе ведёт в рабочее пространство.
+
+**Какие пути можно читать — один владелец на сервере:** `server/modules/file-view/`
+(`fileViewPolicy`, `file-view-policy.ts`). Путь разрешён, если после разрешения симлинков
+(`realpath`, как в `resolvePathUnderRoots`) он лежит под одним из корней:
+
+1. встроенные read-only корни upstream (`/tmp`, `os.tmpdir()`, `~/.claude/projects` —
+   `resolveReadOnlyRootPath` в `server/shared/utils.ts`);
+2. каталоги из переменной окружения **`CLOUDCLI_VIEW_ROOTS`** — абсолютные пути через `:`
+   (у нас `/home/yuri/Projects:/data`; относительные и пустые записи отбрасываются;
+   `file-view-roots.ts`), читается при старте процесса;
+3. каталоги всех зарегистрированных проектов (таблица `projects`, включая архивные), список
+   берётся на каждый запрос.
+
+Симлинк из-под корня наружу не проходит (сравнивается реальный путь). `GET /api/files/view`
+(`authenticateToken`) отдаёт `{ path, name, size, content }` только для обычных файлов
+≤ 5 МБ; ошибки: 400 (не абсолютный путь, не файл, нет `path`), 403 (вне корней), 413 (велик).
+Та же политика подключена к file-tree как `resolveReadOnlyRootPath` в
+`file-tree.module.ts`, поэтому путь (а) — `GET /api/file-tree/projects/:id/file?filePath=`
+— читает файлы из `CLOUDCLI_VIEW_ROOTS` и из каталогов других проектов, какой бы проект ни
+был выбран; записи это не касается (write-пути file-tree сверяют только корень своего
+проекта). Побочное следствие: диалог «обзор файловой системы» тоже может заглядывать в эти
+корни (только чтение).
+
+В юнит `cloudcli.service` добавить строку (и перезапустить в спокойный момент):
+
+```ini
+Environment=CLOUDCLI_VIEW_ROOTS=/home/yuri/Projects:/data
+```
+
+Без неё работают только каталоги проектов и встроенные корни.
+
+Формат ссылки для главной сессии: `[отчёт](/view?path=/home/yuri/Projects/hq/reports/<файл>.md)`
+— новая вкладка; `/home/yuri/Projects/hq/reports/<файл>.md` голым текстом или в кавычках —
+панель редактора в этой же вкладке. Пробелы в пути в `/view?path=` кодировать (`%20`).
+
+Тесты: `server/modules/file-view/tests/` (разбор env, политика на реальных каталогах —
+внутри/снаружи/симлинк/`..`/каталог проекта, сервис — лимит, не файл, 403, маршрут — разбор
+`path` из query, коды ошибок), `src/modules/chat/tests/markdownFilePaths.test.ts` и
+`fileReferenceLinks.test.tsx` (ссылка `/view?…` — новая вкладка, голый путь и путь в кавычках —
+редактор, не-markdown путь остаётся текстом), `src/modules/file-view/tests/viewedFile.test.ts`,
+`src/modules/code-editor/tests/viewerDocumentSource.test.tsx` (без проекта — viewer-эндпоинт,
+read-only, без «Сохранить»; markdown открыт отрендеренным, переключатель показывает исходник).
+
+## Место вкладки плагина: `tabOrder`
+
+В upstream вкладки плагинов всегда идут в хвост после встроенных, за разделителем. Форк
+читает из манифеста плагина поле `tabOrder` (целое ≥ 0; `validateManifest` и `scanPlugins` в
+`server/modules/plugins/plugin-registry.service.ts`, тип `Plugin.tabOrder: number | null` в
+`src/shared/types.ts`): это число встроенных вкладок, после которых ставится плагин — `0` перед
+«Чатом», `1` сразу после него, число больше длины полосы — после последней встроенной. Список
+строит чистая функция `orderTabs(builtIn, plugins)`
+(`src/modules/project-workspace/utils/workspaceTabOrder.ts`): позиционированные плагины
+встраиваются в ряд встроенных (равные слоты — в порядке сканирования), остальные — в хвост, и
+разделитель рисуется только перед хвостом (`WorkspaceTabs.tsx`). У доски штаба `"tabOrder": 1`.
+Тесты: `workspaceTabOrder.test.ts`, `server/modules/plugins/tests/plugin-registry.test.ts`.
 
 ## Как обновляться
 
@@ -294,6 +381,7 @@ Type=simple
 Environment=HOST=0.0.0.0
 Environment=SERVER_PORT=3001
 Environment=PATH=/home/yuri/.nvm/versions/node/v24.12.0/bin:/home/yuri/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=CLOUDCLI_VIEW_ROOTS=/home/yuri/Projects:/data
 WorkingDirectory=/home/yuri/Projects/hq
 ExecStart=/home/yuri/.nvm/versions/node/v24.12.0/bin/node /home/yuri/Projects/cloudcli/dist-server/server/index.js
 Restart=on-failure
