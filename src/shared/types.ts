@@ -1219,6 +1219,9 @@ export type Plugin = {
   entry: string;
   server: string | null;
   permissions: string[];
+  // Slot in the workspace tab bar (`0` = before the first built-in tab, `1` =
+  // right after it); `null` keeps the plugin after the built-in tabs.
+  tabOrder: number | null;
   enabled: boolean;
   serverRunning: boolean;
   dirName: string;

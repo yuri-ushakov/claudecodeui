@@ -6,6 +6,7 @@ import { useTranslation } from 'react-i18next';
 import { Tooltip, PillBar, Pill } from '@/shared/ui';
 import type { AppTab } from '@/shared/types';
 import { usePlugins,PluginIcon } from '@/modules/plugins';
+import { orderTabs } from '@/modules/project-workspace/utils/workspaceTabOrder';
 
 type WorkspaceTabsProps = {
   activeTab: AppTab;
@@ -68,17 +69,23 @@ export default function WorkspaceTabs({
     ...(shouldShowTasksTab ? [TASKS_TAB] : []),
   ];
 
-  const pluginTabs: PluginTab[] = plugins
+  const pluginTabs = plugins
     .filter((p) => p.enabled)
     .map((p) => ({
-      kind: 'plugin',
-      id: `plugin:${p.name}` as AppTab,
-      label: p.displayName,
-      pluginName: p.name,
-      iconFile: p.icon,
+      tab: {
+        kind: 'plugin',
+        id: `plugin:${p.name}` as AppTab,
+        label: p.displayName,
+        pluginName: p.name,
+        iconFile: p.icon,
+      } satisfies PluginTab,
+      // Older servers do not send the field; treat it as "no slot requested".
+      tabOrder: p.tabOrder ?? null,
     }));
 
-  const tabs: TabDefinition[] = [...builtInTabs, ...pluginTabs];
+  // A plugin may ask for a slot among the built-in tabs (`tabOrder` in its
+  // manifest); the rest trail behind a separator, as they always did.
+  const { tabs, separatorIndex } = orderTabs<TabDefinition, TabDefinition>(builtInTabs, pluginTabs);
 
   const handleTabKeyDown = (event: KeyboardEvent<HTMLButtonElement>) => {
     const tabList = event.currentTarget.closest('[role="tablist"]');
@@ -111,7 +118,7 @@ export default function WorkspaceTabs({
 
         return (
           <Fragment key={`${tab.id}-${index}`}>
-            {index === builtInTabs.length && pluginTabs.length > 0 && (
+            {index === separatorIndex && (
               <span aria-hidden="true" className="mx-1 h-4 w-px shrink-0 bg-border" />
             )}
             <Tooltip content={displayLabel} position="bottom">

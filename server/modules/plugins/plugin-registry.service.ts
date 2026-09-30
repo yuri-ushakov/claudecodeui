@@ -92,7 +92,20 @@ export function validateManifest(manifest) {
     }
   }
 
+  if (manifest.tabOrder !== undefined && !isValidTabOrder(manifest.tabOrder)) {
+    return { valid: false, error: 'tabOrder must be an integer greater than or equal to 0' };
+  }
+
   return { valid: true };
+}
+
+/**
+ * Whether a manifest's `tabOrder` names a slot in the workspace tab bar: a
+ * non-negative integer (`0` = before the first built-in tab, `1` = right after
+ * it, and so on). Plugins without one keep their place at the end of the bar.
+ */
+function isValidTabOrder(value) {
+  return typeof value === 'number' && Number.isInteger(value) && value >= 0;
 }
 
 const BUILD_TIMEOUT_MS = 60_000;
@@ -212,6 +225,8 @@ export function scanPlugins() {
         entry: manifest.entry,
         server: manifest.server || null,
         permissions: manifest.permissions || [],
+        // Validated above: absent means "after the built-in tabs", as before.
+        tabOrder: manifest.tabOrder ?? null,
         enabled: config[manifest.name]?.enabled !== false, // enabled by default
         dirName: entry.name,
         repoUrl,
