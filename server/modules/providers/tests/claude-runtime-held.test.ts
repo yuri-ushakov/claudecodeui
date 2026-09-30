@@ -182,6 +182,16 @@ const taskNotification = (taskId: string, toolUseId: string, status: string) => 
   type: 'system', subtype: 'task_notification', session_id: NATIVE_ID, task_id: taskId, tool_use_id: toolUseId, status, summary: `Task ${taskId} ${status}`, output_file: '',
 });
 const result = () => ({ type: 'result', subtype: 'success', session_id: NATIVE_ID, result: 'done', duration_ms: 1, num_turns: 1 });
+/**
+ * What a resumed CLI emits before it looks at the turn's message, when the
+ * previous process left a background agent unfinished: the orphan's
+ * notification, settled as a prompt of its own without a model call. Shape
+ * as observed from CLI 2.1.284.
+ */
+const orphanSettled = () => ({
+  type: 'result', subtype: 'success', session_id: NATIVE_ID, duration_ms: 0, duration_api_ms: 0, num_turns: 0,
+  origin: { kind: 'task-notification' },
+});
 
 const texts = (writer: Writer) => writer.received
   .filter((message) => message.kind === 'text' && message.role === 'assistant')
@@ -376,6 +386,122 @@ test('a turn the held process cannot serve ends it for good and gets a working p
     } finally {
       await rm(otherCwd, { recursive: true, force: true });
     }
+  });
+});
+
+test('a notification the resumed CLI settles by itself does not end the turn or close its stdin', async () => {
+  // The case behind every "Stream closed" seen in the field: the previous
+  // process died with a background agent running, and the next process, on
+  // resume, first reports that agent as orphaned - a task-notification prompt
+  // of its own, settled with a `result` before the user's message is even
+  // looked at. Taken for the end of the turn, that result closed stdin under
+  // the turn that then ran, and every permission request failed.
+  await withConversation('app-oneshot-orphan', async ({ script, turn }) => {
+    const station = createWriter();
+    const running = turn(station, 'carry on', { toolsSettings: { keepSessionAlive: false } });
+    await settle();
+
+    script.emit(taskNotification('orphan', 'toolu_old', 'failed'));
+    script.emit(init());
+    script.emit(orphanSettled());
+    await settle();
+
+    assert.equal(kinds(station).includes('complete'), false, 'the client is not told the turn is over');
+    assert.equal(script.released(), false, 'stdin stays open for the turn still to come');
+
+    // The turn proper: its permission channel works.
+    script.emit(init());
+    const canUseTool = script.options().canUseTool as (
+      toolName: string, input: unknown, context: unknown,
+    ) => Promise<{ behavior: string }>;
+    const decision = canUseTool('Bash', { command: 'git status' }, {});
+    await settle();
+    const request = station.received.find((message) => message.kind === 'permission_request');
+    assert.ok(request, 'the prompt reaches the writer');
+    resolveToolApproval(request.requestId as string, { allow: true });
+    assert.equal((await decision).behavior, 'allow');
+    assert.equal(script.released(), false, 'still open after the request');
+
+    script.emit(say('done'));
+    script.emit(result());
+    await settle();
+    assert.equal(kinds(station).filter((kind) => kind === 'complete').length, 1, 'the turn completes on its own result');
+    assert.equal(script.released(), true, 'and with nothing outstanding, stdin closes then');
+    script.end();
+    await running;
+  });
+});
+
+test('the same notification on a held process leaves the turn being served', async () => {
+  await withConversation('app-held-orphan', async ({ script, turn, sessionId }) => {
+    const station = createWriter();
+    const first = turn(station);
+    await settle();
+
+    script.emit(taskNotification('orphan', 'toolu_old', 'failed'));
+    script.emit(init());
+    script.emit(orphanSettled());
+    await settle();
+
+    assert.equal(kinds(station).includes('complete'), false);
+    assert.equal(getHeldSession(sessionId)?.busy, true, 'the turn is still being served');
+
+    script.emit(say('answer'));
+    script.emit(result());
+    await first;
+    assert.equal(kinds(station).filter((kind) => kind === 'complete').length, 1);
+    assert.equal(getHeldSession(sessionId)?.busy, false);
+  });
+});
+
+test('a held process let go when the switch is turned off leaves the next one-shot turn its stdin', async () => {
+  // The turn after the switch goes off retires the held process explicitly;
+  // its grace-period termination fires seconds later, while the one-shot
+  // process of the new turn is up. Everything deferred must be by instance:
+  // the new process keeps its stdin, and its permission channel keeps working.
+  await withConversation('app-held-then-oneshot', async ({ script, turn, sessionId }) => {
+    const station = createWriter();
+    const first = turn(station);
+    await settle();
+    script.emit(init());
+    script.emit(toolUse('toolu_agent', 'Agent', { prompt: 'work for a while', run_in_background: true }));
+    script.emit(taskStarted('a1', 'toolu_agent', 'local_agent'));
+    script.emit(ack('toolu_agent', 'Agent launched in background. Task ID: a1', { status: 'async_launched', taskId: 'a1' }));
+    script.emit(result());
+    await first;
+    const old = script.process(0);
+    assert.ok(getHeldSession(sessionId), 'held, with an agent running');
+
+    const tablet = createWriter();
+    const second = turn(tablet, 'switch is off now', { toolsSettings: { keepSessionAlive: false } });
+    await settle();
+
+    assert.equal(script.starts(), 2, 'a one-shot process was started');
+    assert.equal(getHeldSession(sessionId), null, 'nothing is held any more');
+    assert.equal(old.released(), true, 'the old process had its stdin ended');
+    const fresh = script.process(1);
+    assert.equal(fresh.released(), false);
+
+    // Past the old process's grace: it was terminated, the new one untouched.
+    await new Promise((resolve) => { setTimeout(resolve, 5200); });
+    assert.equal(old.terminated(), true, 'the old process was terminated after its grace');
+    assert.equal(fresh.released(), false, 'the new process still has its stdin');
+
+    const canUseTool = fresh.options().canUseTool as (
+      toolName: string, input: unknown, context: unknown,
+    ) => Promise<{ behavior: string }>;
+    const decision = canUseTool('Bash', { command: 'uname' }, {});
+    await settle();
+    const request = tablet.received.find((message) => message.kind === 'permission_request');
+    assert.ok(request, 'the prompt lands on the new turn\'s writer');
+    resolveToolApproval(request.requestId as string, { allow: true });
+    assert.equal((await decision).behavior, 'allow');
+    assert.equal(fresh.released(), false);
+
+    fresh.emit(result());
+    await settle();
+    fresh.end();
+    await second;
   });
 });
 

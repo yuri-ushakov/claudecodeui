@@ -68,6 +68,7 @@ async function sendClaimedQueuedMessage(
       userId: candidate.userId,
       content: message.content,
       options: { ...message.options, attachments: message.attachments },
+      turnSource: 'queued',
     },
     { runtime },
   );

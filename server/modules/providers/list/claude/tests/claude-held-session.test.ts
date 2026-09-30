@@ -360,6 +360,28 @@ test('what the process pushes between turns reaches the handler of the last turn
   driven.end();
 });
 
+test('a result the process settles on its own does not end the turn', async () => {
+  // On resume the CLI first settles what the previous process left behind (an
+  // orphaned agent's notification) with a `result` of its own, stamped
+  // `origin.kind = task-notification`, before it looks at the turn's message.
+  const session = new HeldClaudeSession({ sessionKey: 'session-16', fingerprint: fingerprint() });
+  const driven = drivenQuery(session);
+  session.start(driven.instance, () => {});
+
+  const seen: unknown[] = [];
+  const running = session.runTurn({ promptMessages: [{ text: 'one' }], onMessage: (m) => seen.push(m) });
+  driven.emit({ type: 'result', subtype: 'success', num_turns: 0, origin: { kind: 'task-notification' } });
+  await sleep(5);
+  assert.equal(session.busy, true, 'still serving: that was not this turn\'s result');
+
+  driven.emit({ type: 'result', subtype: 'success' });
+  await running;
+  assert.equal(seen.length, 2, 'the handler saw both; only the second ended the turn');
+
+  session.close();
+  driven.end();
+});
+
 test('the writer relay follows each turn', async () => {
   const first = { sent: [] as unknown[], send(m: unknown) { this.sent.push(m); }, userId: 'u1' };
   const second = { sent: [] as unknown[], send(m: unknown) { this.sent.push(m); }, userId: 'u2' };

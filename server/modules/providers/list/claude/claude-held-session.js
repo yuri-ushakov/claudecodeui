@@ -56,6 +56,30 @@ export function stableJson(value) {
   ));
 }
 
+/**
+ * Whether an SDK message is the `result` that ends the turn being served.
+ *
+ * The CLI emits a `result` for every prompt it settles, and not all of them
+ * are the host's. On resume it first delivers what it owes from the previous
+ * process: a background agent that never reported back ("didn't finish before
+ * the previous session ended") becomes a task-notification prompt, settled
+ * with a `result` of its own - no model call, `num_turns: 0` - before the
+ * message the turn actually sent is even looked at. Later on, an agent
+ * reporting in runs a follow-up turn whose `result` is stamped the same way.
+ * Taking either for the end of the user's turn closes stdin under a turn that
+ * is still running, and every permission request after that fails in the CLI
+ * with "Stream closed".
+ *
+ * The CLI marks those results with `origin.kind === 'task-notification'`; the
+ * result of a prompt the host sent carries no `origin` at all.
+ *
+ * @param {Object} message - Raw SDK message
+ * @returns {boolean}
+ */
+export function endsTurn(message) {
+  return message?.type === 'result' && message.origin?.kind !== 'task-notification';
+}
+
 /** Held sessions by session key. */
 const heldSessions = new Map();
 
@@ -290,9 +314,9 @@ export class HeldClaudeSession {
   /**
    * Runs one turn on this process.
    *
-   * Resolves when the turn's `result` arrives; the process stays, and so does
-   * the turn's handler, which keeps receiving whatever the process pushes
-   * until the next turn takes over.
+   * Resolves when the turn's own `result` arrives (`endsTurn`); the process
+   * stays, and so does the turn's handler, which keeps receiving whatever the
+   * process pushes until the next turn takes over.
    *
    * @param {Object} args
    * @param {Array<Object>} args.promptMessages - What the user sent
@@ -339,7 +363,7 @@ export class HeldClaudeSession {
       this.turn = {
         onMessage: (message) => {
           onMessage(message);
-          if (message?.type === 'result') {
+          if (endsTurn(message)) {
             finish(null);
           }
         },

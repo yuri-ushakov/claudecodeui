@@ -26,6 +26,7 @@ import {
 } from '@/shared/image-attachments.js';
 import {
   HeldClaudeSession,
+  endsTurn,
   getHeldSession,
   holdSession,
   stableJson,
@@ -120,6 +121,17 @@ function applyClaudeEffort(sdkOptions, resolvedEffort) {
     ultracode: true,
     enableWorkflows: true
   };
+}
+
+/**
+ * The pid of the CLI process behind an SDK query, for the log; `?` when the
+ * SDK does not expose it (a test double, or a query not spawned yet).
+ * @param {Object|null} queryInstance - SDK query
+ * @returns {number|string}
+ */
+function processPid(queryInstance) {
+  const pid = queryInstance?.transport?.process?.pid;
+  return typeof pid === 'number' ? pid : '?';
 }
 
 function createRequestId() {
@@ -998,11 +1010,13 @@ async function queryClaudeSDK(command, options = {}, turnWriter, context) {
   };
 
   // One line per turn on how the process was chosen, so a device switch or
-  // a settings change that costs a process can be read off the log.
-  const logHeldDecision = (decision, previous, mismatches = []) => {
+  // a settings change that costs a process can be read off the log. Written
+  // once the process is known, so the line carries its pid: in the field that
+  // is what tells the turns of one process from those of another.
+  const logHeldDecision = (decision, previous, mismatches = [], instance = queryInstance) => {
     const previousNote = previous ? `previous=held(age=${previous.ageSeconds ?? '?'}s)` : 'previous=none';
     const mismatchNote = mismatches.length > 0 ? ` mismatch=${mismatches.join(',')}` : '';
-    console.log(`[Claude SDK] held: session=${sessionKey()} keepSessionAlive=${keepSessionAlive} policy=${options.toolsSettingsSource || 'client'} ${previousNote} decision=${decision}${mismatchNote}`);
+    console.log(`[Claude SDK] held: session=${sessionKey()} turn=${options.turnSource || 'unknown'} pid=${processPid(instance)} keepSessionAlive=${keepSessionAlive} policy=${options.toolsSettingsSource || 'client'} ${previousNote} decision=${decision}${mismatchNote}`);
   };
 
   try {
@@ -1069,13 +1083,9 @@ async function queryClaudeSDK(command, options = {}, turnWriter, context) {
         getSession(sessionKey())?.releaseInput?.();
       }
     }
-    if (reusable) {
-      logHeldDecision('reused', previous);
-    } else if (keepSessionAlive && !rewindsConversation) {
-      logHeldDecision('new', previous, mismatches);
-    } else {
-      logHeldDecision(rewindsConversation ? 'off(rewind)' : 'off', previous);
-    }
+    const heldDecision = reusable
+      ? 'reused'
+      : keepSessionAlive && !rewindsConversation ? 'new' : rewindsConversation ? 'off(rewind)' : 'off';
 
     if (reusable) {
       // Claimed before anything is applied. `applyTurn` sets the model and the
@@ -1086,6 +1096,7 @@ async function queryClaudeSDK(command, options = {}, turnWriter, context) {
       // the branch below would start a second one and `holdSession` would
       // close this one, ending the turn it is serving.
       if (!reusable.reserve()) {
+        logHeldDecision('busy', previous, [], reusable.instance);
         throw new Error('This session is already serving a turn.');
       }
 
@@ -1267,6 +1278,7 @@ async function queryClaudeSDK(command, options = {}, turnWriter, context) {
         holdSession(heldSession);
       }
     }
+    logHeldDecision(heldDecision, previous, mismatches);
 
     // Track the query instance for abort capability
     if (sessionKey()) {
@@ -1352,7 +1364,14 @@ async function queryClaudeSDK(command, options = {}, turnWriter, context) {
         releasePromptStream();
       }
 
-      if (message.type === 'result') {
+      if (message.type === 'result' && !turnCompleteSent && !endsTurn(message)) {
+        // A prompt the CLI settled on its own before this turn's message was
+        // looked at - the notification about a background agent the previous
+        // process left unfinished, delivered at resume. Not the end of this
+        // turn: nothing goes to the client, and stdin stays open for the turn
+        // that is still to come. (After the turn, the same kind of result is
+        // background work reporting in, handled below.)
+      } else if (message.type === 'result') {
         // The turn is done as far as the client is concerned.
         const abortPending = sessionKey() ? abortedSessionIds.has(sessionKey()) : false;
         const stillOutstanding = backgroundWork.hasOutstanding(sessionKey());

@@ -86,6 +86,13 @@ type ChatWebSocketDependencies = {
 };
 
 /**
+ * Where a turn came from, as the runtime logs it: a message sent from a chat
+ * socket, a scheduled message firing on its timer, a queued draft the server
+ * sent once the session went idle, or an `/api/agent` request.
+ */
+export type TurnSource = 'chat' | 'scheduled' | 'queued' | 'agent';
+
+/**
  * Extracts the authenticated request user id in the formats currently produced
  * by platform and OSS auth code paths.
  */
@@ -157,7 +164,7 @@ async function handleChatSend(
     return;
   }
 
-  await dispatchRun(ws, userId, resolved.sessionId, resolved.session, data, dependencies);
+  await dispatchRun(ws, userId, resolved.sessionId, resolved.session, data, dependencies, 'chat');
 }
 
 type ResolvedSendTarget = {
@@ -205,8 +212,9 @@ function resolveSendTarget(
 /**
  * Registers the run and hands the turn to the provider runtime.
  *
- * `extraRuntimeOptions` is how an edited message asks the provider to resume
- * partway instead of continuing from the tip; a normal send passes nothing.
+ * `turnSource` says who is sending, for the runtime's log. `extraRuntimeOptions`
+ * is how an edited message asks the provider to resume partway instead of
+ * continuing from the tip; a normal send passes nothing.
  */
 async function dispatchRun(
   ws: WebSocket | null,
@@ -215,6 +223,7 @@ async function dispatchRun(
   session: NonNullable<ReturnType<typeof sessionsDb.getSessionById>>,
   data: AnyRecord,
   dependencies: ChatWebSocketDependencies,
+  turnSource: TurnSource,
   extraRuntimeOptions: AnyRecord = {},
   beforeRun?: (run: NonNullable<ReturnType<typeof chatRunRegistry.startRun>>) => void | Promise<void>,
 ): Promise<{ started: boolean; error: string | null }> {
@@ -293,6 +302,7 @@ async function dispatchRun(
     toolsSettingsSource: toolPolicy.source,
     // The client derives this flag from the same settings; keep it in step.
     skipPermissions: Boolean(toolPolicy.toolsSettings?.skipPermissions),
+    turnSource,
   };
 
   let failure: string | null = null;
@@ -383,6 +393,7 @@ async function handleChatEditSend(
     session,
     data,
     dependencies,
+    'chat',
     // `null` is meaningful: the edited turn was the first prompt, so the
     // conversation starts over instead of resuming.
     rewinds
@@ -627,6 +638,8 @@ export async function runDetachedChatTurn(
      * land mid-run, so the timer outranks whatever is running.
      */
     interruptActiveRun?: boolean;
+    /** Who is sending, for the runtime's log; a scheduled message unless said otherwise. */
+    turnSource?: Exclude<TurnSource, 'chat' | 'agent'>;
   },
   dependencies: ChatWebSocketDependencies,
 ): Promise<{ started: boolean; error: string | null }> {
@@ -664,6 +677,7 @@ export async function runDetachedChatTurn(
     session,
     { sessionId: input.sessionId, content: input.content, options: input.options ?? {} },
     dependencies,
+    input.turnSource ?? 'scheduled',
   );
 }
 

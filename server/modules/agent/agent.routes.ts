@@ -1029,7 +1029,8 @@ export function createAgentRouter(dependencies: AgentRouterDependencies): expres
           sessionId: appSessionId,
           model: model,
           effort,
-          permissionMode: 'bypassPermissions' // Bypass all permissions for API calls
+          permissionMode: 'bypassPermissions', // Bypass all permissions for API calls
+          turnSource: 'agent'
         }, run.writer);
 
       } else if (provider === 'cursor') {
