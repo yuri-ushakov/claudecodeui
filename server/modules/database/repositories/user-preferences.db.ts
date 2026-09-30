@@ -5,6 +5,10 @@ type PreferenceRow = {
   preference_value: string;
 };
 
+const isRecord = (value: unknown): value is Record<string, unknown> => (
+  Boolean(value) && typeof value === 'object' && !Array.isArray(value)
+);
+
 /**
  * Decodes one stored preference, dropping any row whose JSON no longer parses
  * rather than failing the whole read. A single corrupted value must not cost
@@ -19,6 +23,38 @@ function decodePreference(row: PreferenceRow): [string, unknown] | null {
   }
 }
 
+/**
+ * What a key holds after an update. An object-valued preference is merged
+ * field by field, so a writer that owns some of its fields sends only those
+ * and never erases the others' (the chat's remembered rules and the settings
+ * dialog's switches share `claudePermissions`). Arrays and scalars are
+ * replaced whole.
+ */
+function mergePreferenceValue(stored: unknown, incoming: unknown): unknown {
+  return isRecord(stored) && isRecord(incoming) ? { ...stored, ...incoming } : incoming;
+}
+
+/** Every preference of one user, decoded, on the given connection. */
+function readPreferences(db: ReturnType<typeof getConnection>, userId: number): Record<string, unknown> {
+  const rows = db
+    .prepare(
+      `SELECT preference_key, preference_value
+       FROM user_preferences
+       WHERE user_id = ?`
+    )
+    .all(userId) as PreferenceRow[];
+
+  const preferences: Record<string, unknown> = {};
+  for (const row of rows) {
+    const decoded = decodePreference(row);
+    if (decoded) {
+      preferences[decoded[0]] = decoded[1];
+    }
+  }
+
+  return preferences;
+}
+
 export const userPreferencesDb = {
   /**
    * Returns every preference the user has ever set, as one object.
@@ -27,29 +63,15 @@ export const userPreferencesDb = {
    * user never changed this" and the client applies its own default.
    */
   getPreferences(userId: number): Record<string, unknown> {
-    const db = getConnection();
-    const rows = db
-      .prepare(
-        `SELECT preference_key, preference_value
-         FROM user_preferences
-         WHERE user_id = ?`
-      )
-      .all(userId) as PreferenceRow[];
-
-    const preferences: Record<string, unknown> = {};
-    for (const row of rows) {
-      const decoded = decodePreference(row);
-      if (decoded) {
-        preferences[decoded[0]] = decoded[1];
-      }
-    }
-
-    return preferences;
+    return readPreferences(getConnection(), userId);
   },
 
   /**
-   * Merge-patches preferences: keys present in `updates` are written, keys
-   * absent are left alone, and a key given as `undefined` is deleted.
+   * Merge-patches preferences at both levels: keys present in `updates` are
+   * written, keys absent are left alone, a key given as `undefined` is
+   * deleted - and within a key, an object value is merged field by field
+   * (`mergePreferenceValue`), so a page whose copy of a setting is behind
+   * cannot put its stale copy of the other fields back.
    *
    * Runs in one transaction so a multi-key save from the settings dialog can
    * never be observed half-applied.
@@ -68,12 +90,13 @@ export const userPreferencesDb = {
     );
 
     db.transaction(() => {
+      const stored = readPreferences(db, userId);
       for (const [key, value] of Object.entries(updates)) {
         if (value === undefined) {
           remove.run(userId, key);
           continue;
         }
-        upsert.run(userId, key, JSON.stringify(value));
+        upsert.run(userId, key, JSON.stringify(mergePreferenceValue(stored[key], value)));
       }
     })();
   },

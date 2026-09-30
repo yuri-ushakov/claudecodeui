@@ -8,7 +8,9 @@ import {
   writeCodeEditorSettings,
 } from '@/shared/codeEditorSettings';
 import {
+  patchUserPreference,
   readUserPreference,
+  refreshUserPreferences,
   writeUserPreferences,
 } from '@/shared/userSettings';
 import { useProviderAuthStatus } from '@/modules/provider-auth';
@@ -83,6 +85,28 @@ const createEmptyClaudePermissions = (): ClaudePermissionsState => ({
   keepSessionAlive: false,
 });
 
+const CLAUDE_PERMISSION_FIELDS = ['allowedTools', 'disallowedTools', 'skipPermissions', 'keepSessionAlive'] as const;
+
+/**
+ * The Claude permission fields the user changed in this dialog: what `edited`
+ * says differently from `loaded`. Only these are written, so a dialog opened
+ * on a page whose copy of the settings is behind (a switch flipped on
+ * another device since the page loaded) cannot put its stale copy of the
+ * other fields back on every device.
+ */
+const changedClaudePermissionFields = (
+  loaded: ClaudePermissionsState,
+  edited: ClaudePermissionsState,
+): Partial<ClaudePermissionsState> => {
+  const changed: Partial<ClaudePermissionsState> = {};
+  for (const field of CLAUDE_PERMISSION_FIELDS) {
+    if (JSON.stringify(loaded[field]) !== JSON.stringify(edited[field])) {
+      (changed as Record<string, unknown>)[field] = edited[field];
+    }
+  }
+  return changed;
+};
+
 const createEmptyCursorPermissions = (): CursorPermissionsState => ({
   ...DEFAULT_CURSOR_PERMISSIONS,
 });
@@ -135,6 +159,8 @@ export function useSettingsController({ isOpen, initialTab }: UseSettingsControl
   const [claudePermissions, setClaudePermissions] = useState<ClaudePermissionsState>(() => (
     createEmptyClaudePermissions()
   ));
+  // What the dialog last read or wrote; a save sends only what differs from it.
+  const savedClaudePermissionsRef = useRef<ClaudePermissionsState>(createEmptyClaudePermissions());
   const [cursorPermissions, setCursorPermissions] = useState<CursorPermissionsState>(() => (
     createEmptyCursorPermissions()
   ));
@@ -153,13 +179,19 @@ export function useSettingsController({ isOpen, initialTab }: UseSettingsControl
 
   const loadSettings = useCallback(async () => {
     try {
+      // The dialog shows the server's copy, not what this page happened to
+      // hold: a setting can have changed on another device since it loaded.
+      await refreshUserPreferences();
+
       const savedClaudeSettings = readUserPreference<ClaudeSettingsStorage>('claudePermissions', {});
-      setClaudePermissions({
+      const loadedClaudePermissions: ClaudePermissionsState = {
         allowedTools: savedClaudeSettings.allowedTools || [],
         disallowedTools: savedClaudeSettings.disallowedTools || [],
         skipPermissions: Boolean(savedClaudeSettings.skipPermissions),
         keepSessionAlive: Boolean(savedClaudeSettings.keepSessionAlive),
-      });
+      };
+      savedClaudePermissionsRef.current = loadedClaudePermissions;
+      setClaudePermissions(loadedClaudePermissions);
       setProjectSortOrder(readUserPreference<ProjectSortOrder>('projectSortOrder', 'name') === 'date' ? 'date' : 'name');
 
       const savedCursorSettings = readUserPreference<CursorSettingsStorage>('cursorPermissions', {});
@@ -223,15 +255,17 @@ export function useSettingsController({ isOpen, initialTab }: UseSettingsControl
     setSaveStatus(null);
 
     try {
-      // One call so the whole dialog's state reaches the server as a single
-      // merge-patch rather than four racing requests.
+      // Claude's permissions are shared with the chat ("remember this rule"),
+      // so only the fields edited here are sent, over whatever is stored.
+      const changedClaudePermissions = changedClaudePermissionFields(savedClaudePermissionsRef.current, claudePermissions);
+      if (Object.keys(changedClaudePermissions).length > 0) {
+        patchUserPreference('claudePermissions', changedClaudePermissions);
+        savedClaudePermissionsRef.current = claudePermissions;
+      }
+
+      // One call so the rest of the dialog's state reaches the server as a
+      // single merge-patch rather than three racing requests.
       writeUserPreferences({
-        claudePermissions: {
-          allowedTools: claudePermissions.allowedTools,
-          disallowedTools: claudePermissions.disallowedTools,
-          skipPermissions: claudePermissions.skipPermissions,
-          keepSessionAlive: claudePermissions.keepSessionAlive,
-        },
         projectSortOrder,
         cursorPermissions: {
           allowedCommands: cursorPermissions.allowedCommands,
@@ -256,10 +290,7 @@ export function useSettingsController({ isOpen, initialTab }: UseSettingsControl
       setSaveStatus('error');
     }
   }, [
-    claudePermissions.allowedTools,
-    claudePermissions.disallowedTools,
-    claudePermissions.skipPermissions,
-    claudePermissions.keepSessionAlive,
+    claudePermissions,
     codexPermissionMode,
     cursorPermissions.allowedCommands,
     cursorPermissions.disallowedCommands,

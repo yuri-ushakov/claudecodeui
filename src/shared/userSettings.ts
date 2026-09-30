@@ -169,6 +169,34 @@ export function writeUserPreference(key: UserPreferenceKey, value: unknown): voi
   notifyListeners();
 }
 
+/**
+ * Writes some fields of an object-valued preference, leaving the rest as they are.
+ *
+ * For a setting several writers share - `claudePermissions` is written by
+ * the settings dialog and by "remember this rule" in the chat - each writer
+ * sends only the fields it changed. The server merges them into what it
+ * holds, so a page whose copy is behind (a switch flipped on another device
+ * since this page loaded) cannot put its stale copy of the other fields back.
+ * The mirror is merged the same way, so reads on this page see the change
+ * at once; a patch that changes nothing sends nothing.
+ */
+export function patchUserPreference(key: UserPreferenceKey, fields: Record<string, unknown>): void {
+  const current = preferences[key];
+  const base = isRecord(current) ? current : {};
+  const next = { ...base, ...fields };
+  if (JSON.stringify(base) === JSON.stringify(next)) {
+    return;
+  }
+
+  preferences = { ...preferences, [key]: next };
+  writeMirror();
+  // Two patches inside one debounce window ride in one request; the second
+  // must not push the first one's fields out of it.
+  const pending = pendingServerWrites[key];
+  queueServerWrite({ [key]: isRecord(pending) ? { ...pending, ...fields } : fields });
+  notifyListeners();
+}
+
 /** Writes several preferences as one change, so listeners re-render once. */
 export function writeUserPreferences(updates: PreferenceRecord): void {
   const changed: PreferenceRecord = {};

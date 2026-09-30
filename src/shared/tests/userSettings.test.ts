@@ -93,6 +93,49 @@ test('writing the value a preference already has sends nothing and notifies nobo
   expect(listener).not.toHaveBeenCalled();
 });
 
+test('a patch writes only the fields it names and keeps the rest', async () => {
+  const store = await loadStore();
+  store.writeUserPreference('claudePermissions', { allowedTools: ['Read'], keepSessionAlive: true });
+  await vi.advanceTimersByTimeAsync(500);
+  saved.length = 0;
+
+  // The chat remembers a rule; it knows nothing about the process switch.
+  store.patchUserPreference('claudePermissions', { allowedTools: ['Read', 'Write'] });
+
+  assert.deepEqual(
+    store.readUserPreference('claudePermissions', null),
+    { allowedTools: ['Read', 'Write'], keepSessionAlive: true },
+    'the page sees the change at once, with the other field intact',
+  );
+  await vi.advanceTimersByTimeAsync(500);
+  assert.deepEqual(saved, [{ claudePermissions: { allowedTools: ['Read', 'Write'] } }], 'only the named field goes up');
+});
+
+test('two patches in one debounce window both reach the server', async () => {
+  const store = await loadStore();
+
+  store.patchUserPreference('claudePermissions', { allowedTools: ['Read'] });
+  store.patchUserPreference('claudePermissions', { skipPermissions: true });
+
+  await vi.advanceTimersByTimeAsync(500);
+  assert.deepEqual(saved, [{ claudePermissions: { allowedTools: ['Read'], skipPermissions: true } }]);
+});
+
+test('a patch that changes nothing sends nothing and notifies nobody', async () => {
+  const store = await loadStore();
+  store.writeUserPreference('claudePermissions', { allowedTools: ['Read'], keepSessionAlive: true });
+  await vi.advanceTimersByTimeAsync(500);
+  saved.length = 0;
+
+  const listener = vi.fn();
+  store.subscribeToUserPreferences(listener);
+  store.patchUserPreference('claudePermissions', { allowedTools: ['Read'] });
+
+  await vi.advanceTimersByTimeAsync(500);
+  assert.deepEqual(saved, []);
+  expect(listener).not.toHaveBeenCalled();
+});
+
 test('a value written in one page load is readable synchronously in the next', async () => {
   const first = await loadStore();
   first.writeUserPreference('theme', 'dark');

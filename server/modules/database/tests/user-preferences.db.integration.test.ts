@@ -70,6 +70,25 @@ test('saving preferences merge-patches instead of replacing the whole set', asyn
   });
 });
 
+test('an object-valued preference is merged field by field; arrays and scalars are replaced', async () => {
+  await withDatabase(() => {
+    userPreferencesDb.savePreferences(USER_ID, {
+      claudePermissions: { allowedTools: ['Read'], keepSessionAlive: true },
+      theme: 'dark',
+    });
+    // The chat remembers a rule: it sends the list and nothing else.
+    userPreferencesDb.savePreferences(USER_ID, {
+      claudePermissions: { allowedTools: ['Read', 'Write'] },
+      theme: 'light',
+    });
+
+    assert.deepEqual(userPreferencesDb.getPreferences(USER_ID), {
+      claudePermissions: { allowedTools: ['Read', 'Write'], keepSessionAlive: true },
+      theme: 'light',
+    });
+  });
+});
+
 test('a preference set to undefined is removed', async () => {
   await withDatabase(() => {
     userPreferencesDb.savePreferences(USER_ID, { theme: 'dark', userLanguage: 'de' });
