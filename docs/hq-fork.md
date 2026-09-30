@@ -173,6 +173,59 @@ one-shot хода stdin открыт и через 5+ с, `canUseTool` дохо�
   `src/modules/sidebar/tests/recentConversationTitleSync.test.ts` (тест не передаёт
   `backgroundSessionIds`) — это ошибка upstream, к патчу отношения не имеет.
 
+## Браузер для агентов (`server/modules/browser-use/`)
+
+Встроенный браузерный модуль upstream (вкладка Browser, MCP `cloudcli-browser`) в форке
+изменён в трёх местах — по итогам проверки 30.09 (карточка `hq/tasks/hq-browser-runtime.md`).
+
+1. **Запуск полного Chromium вместо headless-shell.** Без канала Playwright в headless-режиме
+   берёт `chromium-headless-shell`: `navigator.webdriver = true`, нет `window.chrome` и
+   плагинов, «HeadlessChrome» в Client Hints — сайты видят автоматизацию. Теперь один
+   владелец вопроса «какой браузер и с какими ключами» — `browser-launch.ts`
+   (`readBrowserLaunchConfig` → `buildBrowserLaunchOptions`), обе ветки запуска
+   (`launch` для временной сессии и `launchPersistentContext` для профиля) берут опции
+   оттуда: `channel: 'chromium'` (полный `chromium-1243` из `~/.cache/ms-playwright`, в
+   Playwright ≥ 1.49 с `--headless` это новый headless-режим), `headless: true`,
+   `--disable-blink-features=AutomationControlled`, `--disable-dev-shm-usage`,
+   `ignoreDefaultArgs: ['--enable-automation']`. Проверка готовности (`probeRuntime`) смотрит на
+   исполняемый файл того же канала (`resolveBrowserExecutablePath`: для `chromium` — публичный
+   `executablePath()`, для фирменных каналов — реестр Playwright из `playwright-core/lib/coreBundle`).
+   Переменные окружения (юнит `cloudcli.service`, `Environment=`):
+   - `CLOUDCLI_BROWSER_USE_CHANNEL` — `chromium` (умолчание) или `chrome`, `chrome-beta`,
+     `msedge` и т. д., если фирменный браузер установлен в системе;
+   - `CLOUDCLI_BROWSER_USE_HEADLESS` — `true` (умолчание); `false`/`0`/`no`/`off` — с окном
+     (нужен дисплей: X/Wayland или Xvfb).
+   Результат пробы (`scripts/hq/browser-launch-probe.mjs`, 30.09): `webdriver: false`,
+   `window.chrome` есть, `plugins: 5`, `Sec-Ch-Ua: "Chromium";v="153"` (без HeadlessChrome);
+   **в `User-Agent` «HeadlessChrome/153.0.0.0» остаётся** — это свойство самого Chromium в любом
+   headless-режиме (и у Google Chrome тоже), а не выбранного бинаря. Убрать его можно только
+   подменой UA (`--user-agent`/`userAgent` контекста) или запуском с окном — решение отдельное.
+   Google Chrome при желании: `npx playwright install chrome` (deb, sudo) и
+   `CLOUDCLI_BROWSER_USE_CHANNEL=chrome`; в headless он даёт тот же UA с «Headless».
+2. **Скриншот только по запросу.** Каждый ответ MCP нёс `screenshotDataUrl` (JPEG base64,
+   70–140 КБ) — `navigate`/`snapshot`/`close_session`/`list_sessions` у агентов вылетали за
+   лимит вывода. Владелец вопроса «что из сессии видит потребитель» — `browser-session-views.ts`:
+   `publicSessionView` (вкладка Browser, `/api/browser-use/sessions`, со скриншотом для превью),
+   `agentSessionView` (ответы MCP: метаданные без скриншота), `agentScreenshotView`
+   (`browser_take_screenshot` — свежий скриншот), `agentSnapshotView` (`browser_snapshot`:
+   текст страницы; скриншот — по флагу `includeScreenshot`, по умолчанию false).
+3. **Установка рантайма в каталог приложения.** `Install Runtime` делал `npm install --no-save
+   playwright` в `process.cwd()` — у юнита это `WorkingDirectory=~/Projects/hq`, и пакет
+   уезжал в `hq/node_modules`, а `require('playwright')` из каталога приложения его не видел.
+   Теперь команды установки идут в `APP_ROOT` (`findApplicationRoot`, как в `server/index.ts`);
+   `playwright` добавлен в `optionalDependencies` package.json (`^1.63.0`, lock обновлён), так что
+   `npm ci` его ставит и не выбрасывает. Шаг `install-deps` (системные библиотеки Chromium)
+   требует sudo, которого у сервиса нет: сообщение об ошибке содержит готовую команду с node из
+   nvm и CLI Playwright из каталога приложения —
+   `sudo /home/yuri/.nvm/versions/node/v24.12.0/bin/node /home/yuri/Projects/cloudcli/node_modules/playwright/cli.js install-deps chromium`.
+   Браузер: `npx playwright install chromium` (из корня клона; кладёт в `~/.cache/ms-playwright`).
+
+Тесты: `server/modules/browser-use/tests/browser-launch.test.ts` (конфиг из env, опции запуска,
+путь исполняемого файла по каналу), `browser-session-views.test.ts` (форма ответов UI/агента,
+скриншот только по запросу). Проба вживую без сервера: `node scripts/hq/browser-launch-probe.mjs`
+(`--online` — плюс `https://httpbin.org/headers`, `--shell` — прежний headless-shell для сравнения;
+нужен собранный `dist-server`).
+
 ## Как обновляться
 
 ```bash
