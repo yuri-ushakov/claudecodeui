@@ -277,6 +277,88 @@ test('a refreshed tab stops receiving once its old socket is closed', async () =
   });
 });
 
+test('a socket watching an idle session is an audience of the run started later from elsewhere', async () => {
+  await withIsolatedDatabase(() => {
+    sessionsDb.createAppSession('app-run-9', 'claude', '/workspace/demo');
+    // The tab opened the session while nothing was running.
+    const idleTab = new FakeConnection();
+    chatRunRegistry.watchSessions(idleTab, ['app-run-9']);
+
+    // The turn is sent from another device.
+    const tablet = new FakeConnection();
+    const run = chatRunRegistry.startRun({
+      appSessionId: 'app-run-9',
+      provider: 'claude',
+      providerSessionId: null,
+      connection: tablet,
+      userId: null,
+    });
+    assert.ok(run);
+    run.writer.send({ kind: 'permission_request', provider: 'claude', sessionId: 'native', requestId: 'r1', toolName: 'Bash' });
+
+    assert.deepEqual(tablet.frames.map((frame) => frame.kind), ['permission_request']);
+    assert.deepEqual(idleTab.frames.map((frame) => frame.kind), ['permission_request'], 'the idle tab sees the run from its first event');
+    assert.equal(idleTab.frames[0]?.sessionId, 'app-run-9');
+    assert.equal(idleTab.frames[0]?.seq, 1);
+  });
+});
+
+test('a run with no sender still streams to the sockets watching the session', async () => {
+  await withIsolatedDatabase(() => {
+    sessionsDb.createAppSession('app-run-10', 'claude', '/workspace/demo');
+    const tab = new FakeConnection();
+    chatRunRegistry.watchSessions(tab, ['app-run-10']);
+
+    // A queued draft or a scheduled message: dispatched by the server itself.
+    const run = chatRunRegistry.startRun({
+      appSessionId: 'app-run-10',
+      provider: 'claude',
+      providerSessionId: null,
+      connection: null,
+      userId: null,
+    });
+    assert.ok(run);
+    run.writer.send({ kind: 'tool_use', provider: 'claude', sessionId: 'native', toolName: 'Bash' });
+
+    assert.deepEqual(tab.frames.map((frame) => frame.kind), ['tool_use']);
+  });
+});
+
+test('a socket that moved to another session, or closed, is not seeded into the next run', async () => {
+  await withIsolatedDatabase(() => {
+    sessionsDb.createAppSession('app-run-11', 'claude', '/workspace/demo');
+    sessionsDb.createAppSession('app-run-11b', 'claude', '/workspace/demo');
+    const movedTab = new FakeConnection();
+    chatRunRegistry.watchSessions(movedTab, ['app-run-11']);
+    chatRunRegistry.watchSessions(movedTab, ['app-run-11b']);
+
+    const closedTab = new FakeConnection();
+    chatRunRegistry.watchSessions(closedTab, ['app-run-11']);
+    chatRunRegistry.forgetConnection(closedTab);
+
+    const deadTab = new FakeConnection();
+    chatRunRegistry.watchSessions(deadTab, ['app-run-11']);
+    deadTab.readyState = 3;
+
+    assert.deepEqual(chatRunRegistry.watchersOf('app-run-11'), []);
+    assert.deepEqual(chatRunRegistry.watchersOf('app-run-11b'), [movedTab]);
+
+    const run = chatRunRegistry.startRun({
+      appSessionId: 'app-run-11',
+      provider: 'claude',
+      providerSessionId: null,
+      connection: null,
+      userId: null,
+    });
+    assert.ok(run);
+    run.writer.send({ kind: 'tool_use', provider: 'claude', sessionId: 'native', toolName: 'Bash' });
+
+    assert.deepEqual(movedTab.frames, []);
+    assert.deepEqual(closedTab.frames, []);
+    assert.deepEqual(deadTab.frames, []);
+  });
+});
+
 test('startRun rejects a second concurrent run for the same session', async () => {
   await withIsolatedDatabase(() => {
     sessionsDb.createAppSession('app-run-6', 'opencode', '/workspace/demo');

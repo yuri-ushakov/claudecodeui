@@ -117,6 +117,50 @@ test('a tab that subscribes to an idle session is not attached to its old run', 
   });
 });
 
+test('a tab subscribed to an idle session receives the turn another socket starts later', async () => {
+  await withIsolatedDatabase(async () => {
+    const tab = createFakeSocket();
+    handleChatConnection(
+      tab as never,
+      { user: { id: 1 } } as never,
+      { runtime: { hasBackgroundWork: () => false, getPendingApprovalsForSession: () => [] } as never },
+    );
+    tab.emit('message', JSON.stringify({ type: 'chat.subscribe', sessions: [{ sessionId: SESSION_ID, lastSeq: 0 }] }));
+    await settle();
+    assert.equal(tab.frames[0]?.isProcessing, false);
+
+    // A tablet sends the next message; the runtime asks for a tool approval.
+    const run = chatRunRegistry.startRun({
+      appSessionId: SESSION_ID,
+      provider: 'claude',
+      providerSessionId: 'native-1',
+      connection: createFakeSocket() as never,
+      userId: 1,
+    });
+    assert.ok(run);
+    run.writer.send({ kind: 'permission_request', provider: 'claude', sessionId: 'native-1', requestId: 'r1', toolName: 'Bash' } as never);
+
+    const request = tab.frames.find((frame) => frame.kind === 'permission_request');
+    assert.ok(request, 'the prompt must reach the tab that opened the session before the turn started');
+    assert.equal(request.sessionId, SESSION_ID, 'labelled with the app session id the tab subscribed with');
+  });
+});
+
+test('a closed tab is forgotten and not seeded into the session\'s next run', async () => {
+  await withIsolatedDatabase(async () => {
+    const tab = createFakeSocket();
+    handleChatConnection(
+      tab as never,
+      { user: { id: 1 } } as never,
+      { runtime: { hasBackgroundWork: () => false, getPendingApprovalsForSession: () => [] } as never },
+    );
+    tab.emit('message', JSON.stringify({ type: 'chat.subscribe', sessions: [{ sessionId: SESSION_ID, lastSeq: 0 }] }));
+    await settle();
+    tab.emit('close');
+    assert.deepEqual(chatRunRegistry.watchersOf(SESSION_ID), []);
+  });
+});
+
 test('a completed run stays registered while its session still has background work', async () => {
   mock.timers.enable({ apis: ['setTimeout'] });
   try {

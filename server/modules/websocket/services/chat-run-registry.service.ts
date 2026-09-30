@@ -1,6 +1,7 @@
 import { sessionsDb } from '@/modules/database/index.js';
 import { ChatSessionWriter } from '@/modules/websocket/services/chat-session-writer.service.js';
 import { broadcastSessionUpserted } from '@/modules/websocket/services/session-upsert-broadcast.service.js';
+import { WS_OPEN_STATE } from '@/modules/websocket/services/websocket-state.service.js';
 import type {
   LLMProvider,
   NormalizedMessage,
@@ -58,6 +59,89 @@ const MAX_BUFFERED_EVENTS_PER_RUN = 5000;
  * path all consult it instead of asking each provider runtime individually.
  */
 const runs = new Map<string, ChatRun>();
+
+/**
+ * Which sockets are watching which sessions — the one answer to "who has to
+ * see a run of this session".
+ *
+ * A run's writer used to start with the sending socket alone, and a socket
+ * could only join a run that was already in progress when it subscribed. A
+ * tab that opened a session while it was idle was therefore never an
+ * audience of a turn started elsewhere: from a tablet, from the queued-draft
+ * dispatcher (no socket at all), from a scheduled message or from
+ * `/api/agent`. It received none of that turn's live events — not the tool
+ * calls, not the `complete`, and not the `permission_request`, which is why a
+ * tool waiting for approval timed out with nobody having seen the prompt.
+ *
+ * Every `chat.subscribe` now records its socket as a watcher of the sessions
+ * it names (replacing what the socket watched before — the frame is the
+ * socket's current view), and every new run seeds its writer with the
+ * session's watchers. Closed sockets are dropped when the socket closes and
+ * whenever watchers are read.
+ */
+class SessionAudience {
+  private readonly bySession = new Map<string, Set<RealtimeClientConnection>>();
+  private readonly byConnection = new Map<RealtimeClientConnection, Set<string>>();
+
+  /**
+   * Makes `connection` a watcher of exactly `sessionIds`, forgetting the
+   * sessions it watched before.
+   */
+  watch(connection: RealtimeClientConnection, sessionIds: string[]): void {
+    this.forget(connection);
+    const watched = new Set(sessionIds);
+    this.byConnection.set(connection, watched);
+    for (const sessionId of watched) {
+      let watchers = this.bySession.get(sessionId);
+      if (!watchers) {
+        watchers = new Set();
+        this.bySession.set(sessionId, watchers);
+      }
+      watchers.add(connection);
+    }
+  }
+
+  /** Removes `connection` from every session it watched. */
+  forget(connection: RealtimeClientConnection): void {
+    const watched = this.byConnection.get(connection);
+    if (!watched) {
+      return;
+    }
+    this.byConnection.delete(connection);
+    for (const sessionId of watched) {
+      const watchers = this.bySession.get(sessionId);
+      watchers?.delete(connection);
+      if (watchers && watchers.size === 0) {
+        this.bySession.delete(sessionId);
+      }
+    }
+  }
+
+  /** The open sockets watching `sessionId`; sockets found closed are forgotten on the way. */
+  watchersOf(sessionId: string): RealtimeClientConnection[] {
+    const watchers = this.bySession.get(sessionId);
+    if (!watchers) {
+      return [];
+    }
+    const open: RealtimeClientConnection[] = [];
+    for (const connection of Array.from(watchers)) {
+      if (connection.readyState === WS_OPEN_STATE) {
+        open.push(connection);
+      } else {
+        this.forget(connection);
+      }
+    }
+    return open;
+  }
+
+  /** Test-only: drops every watcher. */
+  clear(): void {
+    this.bySession.clear();
+    this.byConnection.clear();
+  }
+}
+
+const audience = new SessionAudience();
 
 /**
  * Answers whether a completed run must stay registered a while longer. Set by
@@ -229,8 +313,34 @@ export const chatRunRegistry = {
       decorateOutboundEvent: (message) => decorateAndRecordEvent(run, message),
     });
 
+    // Every socket that has this session open sees the run from its first
+    // event, whoever started it.
+    for (const watcher of audience.watchersOf(input.appSessionId)) {
+      run.writer.updateWebSocket(watcher);
+    }
+
     runs.set(input.appSessionId, run);
     return run;
+  },
+
+  /**
+   * Records which sessions a socket is watching — exactly `sessionIds`, so a
+   * socket that moved to another session stops being an audience of the
+   * previous one. Runs started for these sessions from now on stream to the
+   * socket; a run already in progress is joined through `attachConnection`.
+   */
+  watchSessions(connection: RealtimeClientConnection, sessionIds: string[]): void {
+    audience.watch(connection, sessionIds);
+  },
+
+  /** Forgets a socket that closed; nothing is seeded to it afterwards. */
+  forgetConnection(connection: RealtimeClientConnection): void {
+    audience.forget(connection);
+  },
+
+  /** The open sockets currently watching a session (for tests and diagnostics). */
+  watchersOf(appSessionId: string): RealtimeClientConnection[] {
+    return audience.watchersOf(appSessionId);
   },
 
   getRun(appSessionId: string): ChatRun | undefined {
@@ -330,5 +440,6 @@ export const chatRunRegistry = {
    */
   clearAll(): void {
     runs.clear();
+    audience.clear();
   },
 };

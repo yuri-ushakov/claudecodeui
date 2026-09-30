@@ -518,6 +518,17 @@ async function handleChatStopTask(
  * This single message replaces the old `check-session-status`,
  * `get-pending-permissions`, and Claude-only writer reconnect flows.
  */
+/** The session id one `chat.subscribe` target names, or null for a malformed entry. */
+function readSubscribeTargetSessionId(target: unknown): string | null {
+  if (!target || typeof target !== 'object') {
+    return null;
+  }
+  const sessionId = typeof (target as AnyRecord).sessionId === 'string'
+    ? ((target as AnyRecord).sessionId as string).trim()
+    : '';
+  return sessionId || null;
+}
+
 function handleChatSubscribe(
   ws: WebSocket,
   data: AnyRecord,
@@ -525,14 +536,17 @@ function handleChatSubscribe(
 ): void {
   const targets = Array.isArray(data.sessions) ? data.sessions : [];
 
-  for (const target of targets) {
-    if (!target || typeof target !== 'object') {
-      continue;
-    }
+  // The frame is the socket's current view: from now on every run of these
+  // sessions streams to it, whoever starts the run — a tab that opened a
+  // session while it was idle would otherwise never see a turn sent from
+  // another device, from the draft queue or from `/api/agent`.
+  chatRunRegistry.watchSessions(
+    ws,
+    targets.map(readSubscribeTargetSessionId).filter((sessionId): sessionId is string => sessionId !== null),
+  );
 
-    const sessionId = typeof (target as AnyRecord).sessionId === 'string'
-      ? ((target as AnyRecord).sessionId as string).trim()
-      : '';
+  for (const target of targets) {
+    const sessionId = readSubscribeTargetSessionId(target);
     if (!sessionId) {
       continue;
     }
@@ -734,5 +748,6 @@ export function handleChatConnection(
   ws.on('close', () => {
     console.log('[INFO] Chat client disconnected');
     connectedClients.delete(ws);
+    chatRunRegistry.forgetConnection(ws);
   });
 }
