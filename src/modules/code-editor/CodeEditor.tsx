@@ -33,7 +33,21 @@ type CodeEditorProps = {
   onPopOut?: (() => void) | null;
 };
 
-/** Rendered by the code-editor module's own EditorSidebar, and re-exported on the module barrel, as the full CodeMirror editor for one open file. */
+const noop = () => undefined;
+
+/** Whether the file is markdown by its extension, so it opens in the rendered preview. */
+const isMarkdownFileName = (fileName: string): boolean => {
+  const extension = fileName.split('.').pop()?.toLowerCase();
+  return extension === 'md' || extension === 'markdown';
+};
+
+/** Whether the file is an HTML page the header can open in a sandboxed preview tab. */
+const isHtmlFileName = (fileName: string): boolean => {
+  const extension = fileName.split('.').pop()?.toLowerCase();
+  return extension === 'html' || extension === 'htm';
+};
+
+/** Rendered by the code-editor module's own EditorSidebar, by the /view page, and re-exported on the module barrel, as the full CodeMirror editor for one open file. */
 export default function CodeEditor({
   file,
   onClose,
@@ -48,7 +62,23 @@ export default function CodeEditor({
   const paletteOps = usePaletteOps();
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [showDiff, setShowDiff] = useState(Boolean(file.diffInfo));
-  const [markdownPreview, setMarkdownPreview] = useState(false);
+
+  const isMarkdownFile = useMemo(() => isMarkdownFileName(file.name), [file.name]);
+  const isHtmlPreviewFile = useMemo(() => isHtmlFileName(file.name), [file.name]);
+
+  // Markdown opens rendered — a report or a plan is read far more often than
+  // edited — and the header toggle switches to the source. Every open decides
+  // afresh: the sidebar reuses this editor for the next file, so the toggle's
+  // choice is remembered together with the file it was made for and a new
+  // file starts from its own default.
+  const [previewChoice, setPreviewChoice] = useState<{ file: CodeEditorFile; preview: boolean } | null>(null);
+  const markdownPreview = previewChoice?.file === file ? previewChoice.preview : isMarkdownFile;
+  const toggleMarkdownPreview = useCallback(() => {
+    setPreviewChoice((previous) => ({
+      file,
+      preview: !(previous?.file === file ? previous.preview : isMarkdownFileName(file.name)),
+    }));
+  }, [file]);
 
   // The code editor follows the app-wide theme; it has no theme of its own.
   const { isDarkMode } = useTheme();
@@ -70,6 +100,7 @@ export default function CodeEditor({
     isBinary,
     previewKind,
     fileProjectId,
+    readOnly,
     hasUnsavedChanges,
     handleSave,
     handleDownload,
@@ -116,16 +147,6 @@ export default function CodeEditor({
     () => (file.line ? { line: file.line } : null),
     [file],
   );
-
-  const isMarkdownFile = useMemo(() => {
-    const extension = file.name.split('.').pop()?.toLowerCase();
-    return extension === 'md' || extension === 'markdown';
-  }, [file.name]);
-
-  const isHtmlPreviewFile = useMemo(() => {
-    const extension = file.name.split('.').pop()?.toLowerCase();
-    return extension === 'html' || extension === 'htm';
-  }, [file.name]);
 
   const openHtmlPreview = useCallback(() => {
     const previewWindow = window.open('', '_blank');
@@ -222,7 +243,7 @@ export default function CodeEditor({
   ]);
 
   useEditorKeyboardShortcuts({
-    onSave: handleSave,
+    onSave: readOnly ? noop : handleSave,
     onClose: requestClose,
     dependency: content,
   });
@@ -298,10 +319,11 @@ export default function CodeEditor({
             isMarkdownFile={isMarkdownFile}
             isHtmlPreviewFile={isHtmlPreviewFile}
             markdownPreview={markdownPreview}
+            readOnly={readOnly}
             saving={saving}
             saveSuccess={saveSuccess}
             hasUnsavedChanges={hasUnsavedChanges}
-            onToggleMarkdownPreview={() => setMarkdownPreview((previous) => !previous)}
+            onToggleMarkdownPreview={toggleMarkdownPreview}
             onOpenHtmlPreview={openHtmlPreview}
             onOpenSettings={() => paletteOps.openSettings('appearance')}
             onDownload={handleDownload}
@@ -339,6 +361,7 @@ export default function CodeEditor({
               onChange={setContent}
               markdownPreview={markdownPreview}
               isMarkdownFile={isMarkdownFile}
+              readOnly={readOnly}
               isDarkMode={isDarkMode}
               fontSize={fontSize}
               showLineNumbers={showLineNumbers}

@@ -8,6 +8,7 @@ import { TaskMasterProvider,TasksSettingsProvider } from '@/modules/task-master'
 import { WebSocketProvider } from '@/shared/context/WebSocketContext';
 import { PluginsProvider } from '@/modules/plugins';
 import { ProjectWorkspaceRoute } from '@/modules/project-workspace';
+import { FileViewRoute } from '@/modules/file-view';
 import { i18n } from '@/modules/i18n';
 
 const DEPLOYMENT_ASSET_DIRECTORIES = new Set(['assets', 'static', 'icons', 'images']);
@@ -123,6 +124,7 @@ export default function App() {
                     <Routes>
                       <Route path="/" element={<ProjectWorkspaceRoute />} />
                       <Route path="/session/:sessionId" element={<ProjectWorkspaceRoute />} />
+                      <Route path="/view" element={<FileViewRoute />} />
                     </Routes>
                   </Router>
                 </ProtectedRoute>

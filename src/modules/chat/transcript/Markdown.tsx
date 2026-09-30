@@ -11,6 +11,7 @@ import { MermaidDiagram } from '@/modules/code-editor';
 import { MarkdownImage } from '@/modules/chat/transcript/MarkdownImage';
 import { normalizeInlineCodeFences } from '@/modules/chat/utils/chatFormatting';
 import { normalizeLatexDelimiters } from '@/modules/chat/utils/latexDelimiters';
+import { isAbsoluteMarkdownPath, remarkAbsoluteMarkdownPaths } from '@/modules/chat/utils/markdownFilePaths';
 import { copyTextToClipboard } from '@/shared/utils';
 import { SyntaxHighlighter } from '@/shared/syntaxHighlighter';
 import { usePaletteOps } from '@/modules/command-palette';
@@ -28,6 +29,15 @@ type MarkdownProps = {
 // everything else is treated as a workspace file reference.
 const isExternalHref = (href?: string): boolean =>
   !!href && (/^(https?:|mailto:|tel:|data:)/i.test(href) || href.startsWith('#'));
+
+// A link to this app's own file viewer (`/view?path=…`) is a page of its own:
+// it opens in a new browser tab, not in the editor side panel. Relative to the
+// origin, so it works from any device that reaches the app.
+const isViewerHref = (href?: string): boolean => !!href && /^\/view\?/.test(href);
+
+// Links the browser follows itself (in a new tab), as opposed to file
+// references the app opens in its editor.
+const opensInBrowserTab = (href?: string): boolean => isExternalHref(href) || isViewerHref(href);
 
 // Read the trailing `:line` / `:line:col` suffix so the editor can reveal it.
 // Both this and stripLineSuffix are anchored at the end, so callers pass an
@@ -85,6 +95,7 @@ type CodeBlockProps = {
 // `node` is destructured out so react-markdown's hast node never reaches the DOM.
 const CodeBlock = ({ node: _node, className, children, forceBlock, ...props }: CodeBlockProps) => {
   const { t } = useTranslation('chat');
+  const { openFileInEditor } = usePaletteOps();
   const [copied, setCopied] = useState(false);
   // Fenced blocks carry a trailing newline in the tree; trim it so the
   // highlighter doesn't render an empty final line.
@@ -94,10 +105,20 @@ const CodeBlock = ({ node: _node, className, children, forceBlock, ...props }: C
   const shouldInline = !forceBlock && !/[\r\n]/.test(raw);
 
   if (shouldInline) {
+    // Models usually quote a report's path in backticks; an absolute markdown
+    // path opens in the editor on click, like the same path written bare.
+    const markdownPath = isAbsoluteMarkdownPath(raw) ? raw.trim() : null;
     return (
       <code
         className={`whitespace-pre-wrap break-words rounded-md border border-border/70 bg-muted px-1.5 py-0.5 font-mono text-[0.875em] text-foreground ${className || ''
-          }`}
+          }${markdownPath ? ' cursor-pointer text-blue-600 hover:underline dark:text-blue-400' : ''}`}
+        {...(markdownPath
+          ? {
+              role: 'link',
+              tabIndex: 0,
+              onClick: () => openFileInEditor(stripLineSuffix(markdownPath), lineFromRef(markdownPath)),
+            }
+          : {})}
         {...props}
       >
         {children}
@@ -271,7 +292,9 @@ function MarkdownBodyRenderer({ children, breaks = false }: Omit<MarkdownProps, 
   const hasMath = useMemo(() => MATH_DELIMITER.test(content), [content]);
   const remarkPlugins = useMemo(
     () => {
-      const plugins: unknown[] = [remarkGfm];
+      // Bare absolute `.md` paths become links, so a report quoted by path
+      // opens with a click; runs after GFM so autolinked URLs are already links.
+      const plugins: unknown[] = [remarkGfm, remarkAbsoluteMarkdownPaths];
       if (hasMath) {
         plugins.push([remarkMath, { singleDollarTextMath: false }]);
       }
@@ -294,7 +317,7 @@ function MarkdownBodyRenderer({ children, breaks = false }: Omit<MarkdownProps, 
         const linkText = childrenToText(linkChildren);
         const fileRef = looksLikeFilePath(href) ? href : looksLikeFilePath(linkText) ? linkText : undefined;
 
-        if (fileRef && !isExternalHref(href)) {
+        if (fileRef && !opensInBrowserTab(href)) {
           return (
             <a
               href={href || fileRef}

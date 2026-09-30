@@ -94,11 +94,12 @@ export const useCodeEditorDocument = ({ file, projectPath }: UseCodeEditorDocume
           return;
         }
 
-        if (!fileProjectId) {
-          throw new Error('Missing project identifier');
-        }
-
-        const response = await api.readFile(fileProjectId, filePath);
+        // A file opened outside any project (the /view page) is read through
+        // the viewer endpoint, which checks the path against the readable
+        // roots instead of a project directory.
+        const response = fileProjectId
+          ? await api.readFile(fileProjectId, filePath)
+          : await api.viewFile(filePath);
         // Read through readApiJson so the API's own explanation reaches the
         // pane — a directory, a path outside the project root, a missing file.
         // The bare status showed all of those as an opaque "403 Forbidden".
@@ -225,6 +226,8 @@ export const useCodeEditorDocument = ({ file, projectPath }: UseCodeEditorDocume
     isBinary,
     previewKind,
     fileProjectId,
+    // Without a project there is no endpoint to write to: the viewer is read-only.
+    readOnly: !fileProjectId,
     hasUnsavedChanges,
     handleSave,
     handleDownload,

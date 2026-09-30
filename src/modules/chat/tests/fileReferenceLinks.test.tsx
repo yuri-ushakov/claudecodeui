@@ -47,3 +47,33 @@ test('a plain file reference opens with no line', () => {
   clickReference('See [src/foo.ts](src/foo.ts).', 'src/foo.ts');
   assert.deepEqual(openFileInEditor.mock.calls[0], ['src/foo.ts', null]);
 });
+
+test('a link to the file viewer opens in a new browser tab, not in the editor', () => {
+  clickReference('Report: [night](/view?path=/home/yuri/Projects/hq/reports/night.md).', 'night');
+  const anchor = screen.getByText('night').closest('a');
+  assert.ok(anchor);
+  assert.equal(anchor.getAttribute('href'), '/view?path=/home/yuri/Projects/hq/reports/night.md');
+  assert.equal(anchor.getAttribute('target'), '_blank');
+  assert.match(anchor.getAttribute('rel') ?? '', /noopener/);
+  assert.equal(openFileInEditor.mock.calls.length, 0);
+});
+
+test('a bare absolute .md path in text opens in the editor', () => {
+  clickReference(
+    'Written to /home/yuri/Projects/BinanceGate/docs/analysis_night.md, have a look.',
+    '/home/yuri/Projects/BinanceGate/docs/analysis_night.md',
+  );
+  assert.deepEqual(openFileInEditor.mock.calls[0], ['/home/yuri/Projects/BinanceGate/docs/analysis_night.md', null]);
+});
+
+test('an absolute .md path in inline code opens in the editor, with its line', () => {
+  clickReference('See `/home/yuri/Projects/hq/NOW.md:4` for the plan.', '/home/yuri/Projects/hq/NOW.md:4');
+  assert.deepEqual(openFileInEditor.mock.calls[0], ['/home/yuri/Projects/hq/NOW.md', 4]);
+});
+
+test('an absolute path to a non-markdown file in text stays plain text', () => {
+  openFileInEditor.mockReset();
+  render(<Markdown>{'Built /home/yuri/Projects/BinanceGate/build/gate.'}</Markdown>);
+  assert.equal(document.querySelector('a'), null);
+  assert.equal(screen.queryByRole('link'), null);
+});

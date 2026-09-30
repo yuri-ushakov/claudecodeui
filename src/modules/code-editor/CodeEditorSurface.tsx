@@ -13,6 +13,8 @@ type CodeEditorSurfaceProps = {
   onChange: (value: string) => void;
   markdownPreview: boolean;
   isMarkdownFile: boolean;
+  // The source stays selectable and searchable but cannot be typed into.
+  readOnly?: boolean;
   isDarkMode: boolean;
   fontSize: number;
   showLineNumbers: boolean;
@@ -27,6 +29,7 @@ export default function CodeEditorSurface({
   onChange,
   markdownPreview,
   isMarkdownFile,
+  readOnly = false,
   isDarkMode,
   fontSize,
   showLineNumbers,
@@ -72,6 +75,7 @@ export default function CodeEditorSurface({
       onCreateEditor={setView}
       value={content}
       onChange={onChange}
+      readOnly={readOnly}
       extensions={extensions}
       theme={isDarkMode ? oneDark : undefined}
       height="100%"

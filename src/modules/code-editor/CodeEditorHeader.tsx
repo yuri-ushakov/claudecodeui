@@ -11,6 +11,9 @@ type CodeEditorHeaderProps = {
   isMarkdownFile: boolean;
   isHtmlPreviewFile: boolean;
   markdownPreview: boolean;
+  // A file with nowhere to save to (opened outside any project) shows no save
+  // control at all rather than one that can only fail.
+  readOnly?: boolean;
   saving: boolean;
   saveSuccess: boolean;
   hasUnsavedChanges: boolean;
@@ -48,6 +51,7 @@ export default function CodeEditorHeader({
   isMarkdownFile,
   isHtmlPreviewFile,
   markdownPreview,
+  readOnly = false,
   saving,
   saveSuccess,
   hasUnsavedChanges,
@@ -168,25 +172,27 @@ export default function CodeEditorHeader({
           <Download className="h-4 w-4" />
         </button>
 
-        <button
-          type="button"
-          onClick={onSave}
-          disabled={saving}
-          className={`flex items-center justify-center rounded-md p-1.5 transition-colors disabled:opacity-50 ${
-            saveSuccess
-              ? 'bg-green-50 text-green-600 dark:bg-green-900/30 dark:text-green-400'
-              : 'text-gray-600 hover:bg-gray-100 hover:text-gray-900 dark:text-gray-400 dark:hover:bg-gray-800 dark:hover:text-white'
-          }`}
-          title={saveTitle}
-        >
-          {saveSuccess ? (
-            <svg className="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
-            </svg>
-          ) : (
-            <Save className="h-4 w-4" />
-          )}
-        </button>
+        {!readOnly && (
+          <button
+            type="button"
+            onClick={onSave}
+            disabled={saving}
+            className={`flex items-center justify-center rounded-md p-1.5 transition-colors disabled:opacity-50 ${
+              saveSuccess
+                ? 'bg-green-50 text-green-600 dark:bg-green-900/30 dark:text-green-400'
+                : 'text-gray-600 hover:bg-gray-100 hover:text-gray-900 dark:text-gray-400 dark:hover:bg-gray-800 dark:hover:text-white'
+            }`}
+            title={saveTitle}
+          >
+            {saveSuccess ? (
+              <svg className="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
+              </svg>
+            ) : (
+              <Save className="h-4 w-4" />
+            )}
+          </button>
+        )}
 
         {!isSidebar && (
           <button

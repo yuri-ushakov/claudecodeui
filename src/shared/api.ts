@@ -264,6 +264,9 @@ export const api = {
   // Workspace file tree
   readFile: (projectId: string, filePath: string) =>
     get(`/api/file-tree/projects/${projectId}/file${query({ filePath })}`),
+  // One file by absolute path, no project: any registered project's directory
+  // or a CLOUDCLI_VIEW_ROOTS directory. Read-only; backs the /view page.
+  viewFile: (filePath: string) => get(`/api/files/view${query({ path: filePath })}`),
   // Raw bytes for a workspace file. The endpoint requires the auth header, so
   // media call sites fetch a blob through here instead of using a bare `src`.
   readFileBlob: (projectId: string, filePath: string, options: ApiRequestOptions = {}) =>
