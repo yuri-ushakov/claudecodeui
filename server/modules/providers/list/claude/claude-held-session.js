@@ -12,16 +12,20 @@
  * pushed into the same stdin stream. The SDK supports it: `query()` takes an
  * async iterable as its prompt, and that iterable may keep yielding.
  *
- * The catch is that the options built for the first turn - `canUseTool`, the
- * hooks - close over that turn's writer, and messages have to reach whoever
- * asked for the current one. Rather than reach through a stale socket, a turn
- * arriving on a different writer (a reconnect, another window) simply gets its
- * own process: the writer is part of what `matches()` compares.
+ * Two things change from turn to turn and are owned here so that nothing
+ * else has to reach through a stale reference:
  *
- * The process also outlives the turn's handler in the other direction: what
- * the CLI pushes between turns - a background agent reporting in, a task
- * notification - goes to the handler of the turn served last, exactly as the
- * one-shot hold in the runtime keeps reading after a turn's `result`.
+ * - Who is listening. Every run comes with its own writer (the chat run
+ *   registry creates one per `chat.send`, whichever socket it came from), but
+ *   the options handed to `query()` - `canUseTool`, the hooks - were built once,
+ *   for the first turn. They and everything the process emits go through
+ *   `writer`, a relay that always points at the writer of the latest turn. A
+ *   message from another tab or another device therefore lands on the same
+ *   process; only what the process was told to listen to changes.
+ *
+ - What the CLI pushes between turns - a background agent reporting in, a
+ *   task notification - goes to the handler of the turn served last, exactly
+ *   as the one-shot hold in the runtime keeps reading after a turn's `result`.
  *
  * What cannot change is what the CLI fixed at startup: the working directory,
  * the MCP servers, the tool policy, the effort. A turn that needs different
@@ -47,17 +51,82 @@ const heldSessions = new Map();
 /** How long a session may sit idle before its process is let go. */
 const DEFAULT_IDLE_MS = 10 * 60 * 1000;
 
+/**
+ * The writer of whichever turn was served last.
+ *
+ * Exposes the surface the runtime relies on (`send`, `setSessionId`, `userId`,
+ * `isWebSocketWriter`) and forwards each call to the current target. Built
+ * once per held process; the target is switched every time a turn starts.
+ */
+export class LatestTurnWriter {
+  /**
+   * @param {Object|null} writer - Writer of the turn that starts the process
+   */
+  constructor(writer = null) {
+    /** The writer of the turn being served, or of the last one served. */
+    this.current = writer;
+  }
+
+  /**
+   * Points the relay at a new turn's writer.
+   * @param {Object|null} writer - Writer of the turn about to be served
+   */
+  switchTo(writer) {
+    this.current = writer;
+  }
+
+  /**
+   * Forwards one event to the current writer.
+   * @param {unknown} data - Normalized message
+   */
+  send(data) {
+    this.current?.send(data);
+  }
+
+  /**
+   * Labels the current writer with the provider-native session id, when it can take one.
+   * @param {string} sessionId - Provider-native session id
+   */
+  setSessionId(sessionId) {
+    if (typeof this.current?.setSessionId === 'function') {
+      this.current.setSessionId(sessionId);
+    }
+  }
+
+  /**
+   * Adds a socket to the current writer's audience, when it keeps one.
+   * @param {Object} connection - Raw websocket connection
+   */
+  updateWebSocket(connection) {
+    if (typeof this.current?.updateWebSocket === 'function') {
+      this.current.updateWebSocket(connection);
+    }
+  }
+
+  /** The user behind the current writer, for notifications. */
+  get userId() {
+    return this.current?.userId ?? null;
+  }
+
+  /** Mirrors the feature-detection flag of the current writer. */
+  get isWebSocketWriter() {
+    return Boolean(this.current?.isWebSocketWriter);
+  }
+}
+
 export class HeldClaudeSession {
   /**
    * @param {Object} args
    * @param {string} args.sessionKey - Key this session is registered under
    * @param {Object} args.fingerprint - What the process was started with
+   * @param {Object|null} [args.writer] - Writer of the turn that starts the process
    * @param {number} [args.idleMs] - Idle time before the process is released
    * @param {(session: HeldClaudeSession, error: Error|null) => void} [args.onEnd] - Called once the process has ended
    */
   constructor({
     sessionKey,
     fingerprint,
+    writer = null,
     idleMs = DEFAULT_IDLE_MS,
     onEnd = () => {},
   }) {
@@ -66,6 +135,8 @@ export class HeldClaudeSession {
     this.idleMs = idleMs;
     this.onEnd = onEnd;
 
+    /** Where everything this process emits goes: the writer of the latest turn. */
+    this.writer = new LatestTurnWriter(writer);
     /** The SDK query, once started. */
     this.instance = null;
     /** The options it was started with; its callbacks read from this. */
@@ -195,10 +266,11 @@ export class HeldClaudeSession {
    * @param {Object} args
    * @param {Array<Object>} args.promptMessages - What the user sent
    * @param {(message: Object) => void} args.onMessage - Receives every SDK message
+   * @param {Object|null} [args.writer] - Writer of this turn; the relay switches to it
    * @param {boolean} [args.reserved] - Whether the caller already claimed it
    * @returns {Promise<void>}
    */
-  runTurn({ promptMessages, onMessage, reserved = false }) {
+  runTurn({ promptMessages, onMessage, writer = null, reserved = false }) {
     if (this.closed || !this.instance) {
       if (reserved) {
         this.busy = false;
@@ -209,6 +281,10 @@ export class HeldClaudeSession {
     // takes it here, or is turned away because a turn is running.
     if (!reserved && !this.reserve()) {
       return Promise.reject(new Error('This session is already serving a turn.'));
+    }
+
+    if (writer) {
+      this.writer.switchTo(writer);
     }
 
     return new Promise((resolve, reject) => {
@@ -245,7 +321,8 @@ export class HeldClaudeSession {
    * Whether this process was started with what the next turn needs.
    *
    * Only what the CLI fixes at startup is compared. Model and permission mode
-   * are deliberately absent: they are set live by `applyTurn`.
+   * are deliberately absent: they are set live by `applyTurn`. The writer is
+   * absent too: every run brings its own, and the relay follows it.
    *
    * @param {Object} fingerprint - What the next turn would start a process with
    * @returns {boolean}
@@ -261,11 +338,7 @@ export class HeldClaudeSession {
       // callback was built around the first turn's options. Rather than run a
       // turn under a policy that is no longer the user's, a changed one gets
       // its own process.
-      && this.fingerprint.tools === fingerprint.tools
-      // The permission callback and the hooks were built around the writer of
-      // the first turn. A reconnect brings a new one, and rather than reaching
-      // through the old socket, that turn gets its own process.
-      && this.fingerprint.writer === fingerprint.writer;
+      && this.fingerprint.tools === fingerprint.tools;
   }
 
   // ------------------------------------------------------ process lifetime

@@ -81,7 +81,10 @@ test('a turn is only handed to a process started with what it needs', () => {
     'other tool policy',
   );
   assert.equal(session.matches(fingerprint({ effort: 'xhigh' })), false, 'other effort');
-  assert.equal(session.matches(fingerprint({ writer: { name: 'other' } })), false, 'other writer');
+  // Every run brings a writer of its own (another tab, another device, or
+  // just the next message); the session's relay follows it instead of the
+  // process being started over.
+  assert.equal(session.matches(fingerprint({ writer: { name: 'other' } })), true, 'other writer, same process');
 
   // Model and permission mode are set on the live process, so they do not
   // force a new one.
@@ -230,6 +233,85 @@ test('the model is only pushed to the process when it actually changed', async (
 
   await session.applyTurn({ model: 'sonnet', permissionMode: 'default' });
   assert.deepEqual(models, ['sonnet']);
+
+  session.close();
+});
+
+/**
+ * A query whose output the test drives directly, independent of what goes into
+ * the prompt stream — the shape of a process pushing follow-up turns on its own.
+ */
+function drivenQuery(session: HeldClaudeSession) {
+  const queue: Array<Record<string, unknown> | null> = [];
+  let wake: (() => void) | null = null;
+  void (async () => {
+    for await (const _message of session.promptStream()) { /* the CLI reads its stdin */ }
+  })();
+  const instance = (async function* () {
+    for (;;) {
+      if (queue.length === 0) {
+        await new Promise<void>((resolve) => { wake = resolve; });
+        wake = null;
+        continue;
+      }
+      const next = queue.shift();
+      if (next === null || next === undefined) {
+        return;
+      }
+      yield next;
+    }
+  })() as AsyncGenerator<unknown> & {
+    setModel: (model?: string) => Promise<void>;
+    setPermissionMode: (mode: string) => Promise<void>;
+  };
+  instance.setModel = async () => {};
+  instance.setPermissionMode = async () => {};
+  return {
+    instance,
+    emit: (message: Record<string, unknown>) => { queue.push(message); wake?.(); },
+    end: () => { queue.push(null); wake?.(); },
+  };
+}
+
+const sleep = (ms: number) => new Promise((resolve) => { setTimeout(resolve, ms); });
+
+test('what the process pushes between turns reaches the handler of the last turn', async () => {
+  const session = new HeldClaudeSession({ sessionKey: 'session-11', fingerprint: fingerprint() });
+  const driven = drivenQuery(session);
+  session.start(driven.instance, () => {});
+
+  const seen: unknown[] = [];
+  const running = session.runTurn({ promptMessages: [{ text: 'one' }], onMessage: (m) => seen.push(m) });
+  driven.emit({ type: 'result', subtype: 'success' });
+  await running;
+
+  driven.emit({ type: 'assistant', text: 'background agent reporting' });
+  await sleep(5);
+  assert.deepEqual(seen, [
+    { type: 'result', subtype: 'success' },
+    { type: 'assistant', text: 'background agent reporting' },
+  ]);
+
+  session.close();
+  driven.end();
+});
+
+test('the writer relay follows each turn', async () => {
+  const first = { sent: [] as unknown[], send(m: unknown) { this.sent.push(m); }, userId: 'u1' };
+  const second = { sent: [] as unknown[], send(m: unknown) { this.sent.push(m); }, userId: 'u2' };
+  const session = new HeldClaudeSession({ sessionKey: 'session-12', fingerprint: fingerprint(), writer: first });
+  const seen: unknown[] = [];
+  session.start(fakeQuery(session, seen), () => {});
+
+  session.writer.send('to the first');
+  assert.equal(session.writer.userId, 'u1');
+
+  await session.runTurn({ promptMessages: [{ text: 'two' }], onMessage: () => {}, writer: second });
+  session.writer.send('to the second');
+
+  assert.deepEqual(first.sent, ['to the first']);
+  assert.deepEqual(second.sent, ['to the second']);
+  assert.equal(session.writer.userId, 'u2');
 
   session.close();
 });

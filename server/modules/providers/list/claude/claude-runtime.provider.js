@@ -865,11 +865,11 @@ async function loadMcpConfig(cwd) {
  * Executes a Claude query using the SDK
  * @param {string} command - User prompt/command
  * @param {Object} options - Query options
- * @param {Object} ws - WebSocket connection
+ * @param {Object} turnWriter - Writer of this run (the chat run registry creates one per turn)
  * @param {Object} context - Provider-scoped model, session, and auth lookups
  * @returns {Promise<void>}
  */
-async function queryClaudeSDK(command, options = {}, ws, context) {
+async function queryClaudeSDK(command, options = {}, turnWriter, context) {
   const { sessionId, sessionSummary } = options;
   // Callers pass the stable app session id; the SDK only understands the
   // provider-native id recorded on the session row.
@@ -881,6 +881,14 @@ async function queryClaudeSDK(command, options = {}, ws, context) {
   // Process-map key: the app session id when the caller supplied one, else
   // the provider-native id once captured (legacy/direct API callers).
   const sessionKey = () => sessionId || capturedSessionId || null;
+
+  // Where this turn's events go. A one-shot process writes to this run's
+  // writer. A held process serves many runs, each with its own writer, while
+  // its callbacks (`canUseTool`, the hooks) were built once - so for it this
+  // is the session's relay, which follows the writer of the latest turn.
+  // Settled once the held-or-not decision below is made, before any callback
+  // that captures it is built.
+  let ws = turnWriter;
 
   const emitNotification = (event) => {
     notifyUserIfEnabled({
@@ -1024,9 +1032,10 @@ async function queryClaudeSDK(command, options = {}, ws, context) {
       effort: sdkOptions.effort || '',
       model: sdkOptions.model || '',
       permissionMode: sdkOptions.permissionMode || 'default',
-      writer: ws,
     };
 
+    // Decided before the callbacks below are built, so that they capture the
+    // held session's writer relay rather than this one turn's writer.
     const reusable = keepSessionAlive && !rewindsConversation ? getHeldSession(sessionKey()) : null;
     if (reusable && reusable.matches(fingerprint)) {
       // Claimed before anything is applied. `applyTurn` sets the model and the
@@ -1060,8 +1069,12 @@ async function queryClaudeSDK(command, options = {}, ws, context) {
       heldSession = new HeldClaudeSession({
         sessionKey: sessionKey(),
         fingerprint,
+        writer: turnWriter,
         onEnd: endHeldProcess,
       });
+    }
+    if (heldSession) {
+      ws = heldSession.writer;
     }
 
     sdkOptions.hooks = {
@@ -1195,6 +1208,8 @@ async function queryClaudeSDK(command, options = {}, ws, context) {
         delete sdkOptions.hooks;
         // The retry falls back to a one-shot run: the held stream cannot be
         // handed out twice, and this path is a compatibility fallback anyway.
+        // The relay still points at this turn's writer, so the callbacks
+        // built above keep working.
         heldPrompt.release();
         heldSession?.close();
         heldSession = null;
@@ -1363,6 +1378,7 @@ async function queryClaudeSDK(command, options = {}, ws, context) {
       await heldSession.runTurn({
         promptMessages,
         onMessage: handleTurnMessage,
+        writer: turnWriter,
         reserved: heldTurnReserved,
       });
     } else {
