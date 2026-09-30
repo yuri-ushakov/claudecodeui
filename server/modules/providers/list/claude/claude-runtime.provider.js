@@ -961,7 +961,13 @@ async function queryClaudeSDK(command, options = {}, turnWriter, context) {
   };
 
   // Arms (or re-arms) the idle countdown that eventually closes stdin.
+  // Only for a one-shot process: a held one has a single owner for that
+  // decision, the HeldClaudeSession, which asks the turn whether it is still
+  // holding for background work and measures silence itself.
   const scheduleRelease = () => {
+    if (heldSession) {
+      return;
+    }
     if (idleReleaseTimer) {
       clearTimeout(idleReleaseTimer);
       idleReleaseTimer = null;
@@ -1070,6 +1076,7 @@ async function queryClaudeSDK(command, options = {}, turnWriter, context) {
         sessionKey: sessionKey(),
         fingerprint,
         writer: turnWriter,
+        backgroundWorkCeilingMs: BG_WAIT_CEILING_MS,
         onEnd: endHeldProcess,
       });
     }
@@ -1360,7 +1367,8 @@ async function queryClaudeSDK(command, options = {}, turnWriter, context) {
           scheduleRelease();
         } else {
           // Either nothing was backgrounded, or the background work just
-          // reported in — let the CLI exit now, as it always has.
+          // reported in — let the CLI exit now, as it always has. (A held
+          // process ignores this: its own idle timer decides.)
           heldForBackgroundWork = false;
           releasePromptStream();
         }
@@ -1374,11 +1382,13 @@ async function queryClaudeSDK(command, options = {}, turnWriter, context) {
       // The session reads the stream for all of its turns; this one gets its
       // messages through the callback and ends with its own `result`. The
       // handler stays attached afterwards for whatever the process pushes
-      // between turns.
+      // between turns, and it answers the session's idle timer with whether
+      // it is still holding for background work.
       await heldSession.runTurn({
         promptMessages,
         onMessage: handleTurnMessage,
         writer: turnWriter,
+        isHoldingForBackgroundWork: () => heldForBackgroundWork,
         reserved: heldTurnReserved,
       });
     } else {

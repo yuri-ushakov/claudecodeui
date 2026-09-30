@@ -12,8 +12,8 @@
  * pushed into the same stdin stream. The SDK supports it: `query()` takes an
  * async iterable as its prompt, and that iterable may keep yielding.
  *
- * Two things change from turn to turn and are owned here so that nothing
- * else has to reach through a stale reference:
+ * Two things the process was built around change from turn to turn and are
+ * owned here so that nothing else has to reach through a stale reference:
  *
  * - Who is listening. Every run comes with its own writer (the chat run
  *   registry creates one per `chat.send`, whichever socket it came from), but
@@ -23,9 +23,11 @@
  *   message from another tab or another device therefore lands on the same
  *   process; only what the process was told to listen to changes.
  *
- - What the CLI pushes between turns - a background agent reporting in, a
- *   task notification - goes to the handler of the turn served last, exactly
- *   as the one-shot hold in the runtime keeps reading after a turn's `result`.
+ * - When to let the process go. One timer, armed whenever the process is not
+ *   serving a turn and re-armed by every message it sends. How long it waits
+ *   depends on what the latest turn reports: an idle conversation is released
+ *   after `idleMs`; one whose background work is still outstanding gets the
+ *   ceiling the one-shot hold in the runtime uses as its backstop.
  *
  * What cannot change is what the CLI fixed at startup: the working directory,
  * the MCP servers, the tool policy, the effort. A turn that needs different
@@ -48,7 +50,7 @@ export function stableJson(value) {
 /** Held sessions by session key. */
 const heldSessions = new Map();
 
-/** How long a session may sit idle before its process is let go. */
+/** How long a session may sit idle, with nothing outstanding, before its process is let go. */
 const DEFAULT_IDLE_MS = 10 * 60 * 1000;
 
 /**
@@ -120,7 +122,8 @@ export class HeldClaudeSession {
    * @param {string} args.sessionKey - Key this session is registered under
    * @param {Object} args.fingerprint - What the process was started with
    * @param {Object|null} [args.writer] - Writer of the turn that starts the process
-   * @param {number} [args.idleMs] - Idle time before the process is released
+   * @param {number} [args.idleMs] - Idle time, with nothing outstanding, before the process is released
+   * @param {number} [args.backgroundWorkCeilingMs] - Idle time while background work is outstanding
    * @param {(session: HeldClaudeSession, error: Error|null) => void} [args.onEnd] - Called once the process has ended
    */
   constructor({
@@ -128,11 +131,13 @@ export class HeldClaudeSession {
     fingerprint,
     writer = null,
     idleMs = DEFAULT_IDLE_MS,
+    backgroundWorkCeilingMs = DEFAULT_IDLE_MS,
     onEnd = () => {},
   }) {
     this.sessionKey = sessionKey;
     this.fingerprint = fingerprint;
     this.idleMs = idleMs;
+    this.backgroundWorkCeilingMs = backgroundWorkCeilingMs;
     this.onEnd = onEnd;
 
     /** Where everything this process emits goes: the writer of the latest turn. */
@@ -267,10 +272,12 @@ export class HeldClaudeSession {
    * @param {Array<Object>} args.promptMessages - What the user sent
    * @param {(message: Object) => void} args.onMessage - Receives every SDK message
    * @param {Object|null} [args.writer] - Writer of this turn; the relay switches to it
+   * @param {() => boolean} [args.isHoldingForBackgroundWork] - Whether, as far as
+   *   this turn knows, work is still running that the process must stay up for
    * @param {boolean} [args.reserved] - Whether the caller already claimed it
    * @returns {Promise<void>}
    */
-  runTurn({ promptMessages, onMessage, writer = null, reserved = false }) {
+  runTurn({ promptMessages, onMessage, writer = null, isHoldingForBackgroundWork = () => false, reserved = false }) {
     if (this.closed || !this.instance) {
       if (reserved) {
         this.busy = false;
@@ -311,6 +318,7 @@ export class HeldClaudeSession {
           }
         },
         onError: finish,
+        isHoldingForBackgroundWork,
       };
 
       this.push(promptMessages);
@@ -405,12 +413,16 @@ export class HeldClaudeSession {
    * does the turn's handler: a message arriving between turns (background work
    * reporting in, a task notification) reaches the handler of the turn served
    * last, which shows it and keeps the background-work bookkeeping current.
+   * Every message also counts as activity for the idle timer.
    */
   async consume() {
     let failure = null;
     try {
       for await (const message of this.instance) {
         this.turn?.onMessage(message);
+        if (!this.busy) {
+          this.scheduleIdle();
+        }
       }
     } catch (error) {
       failure = error;
@@ -433,16 +445,24 @@ export class HeldClaudeSession {
     }
   }
 
-  /** Lets the process go once the conversation has gone quiet. */
+  /**
+   * Arms (or re-arms) the countdown that lets the process go.
+   *
+   * The delay is the idle allowance when nothing is outstanding, and the
+   * background-work ceiling when the latest turn reports that it is still
+   * holding the process for work that has not reported back. Either way the
+   * countdown measures silence: any message from the process resets it.
+   */
   scheduleIdle() {
     this.clearIdle();
     if (this.closed) {
       return;
     }
+    const delay = this.turn?.isHoldingForBackgroundWork?.() ? this.backgroundWorkCeilingMs : this.idleMs;
     this.idleTimer = setTimeout(() => {
       this.idleTimer = null;
       this.close();
-    }, this.idleMs);
+    }, delay);
     // A held process must never be the reason the server cannot exit.
     this.idleTimer.unref?.();
   }

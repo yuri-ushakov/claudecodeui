@@ -275,6 +275,60 @@ function drivenQuery(session: HeldClaudeSession) {
 
 const sleep = (ms: number) => new Promise((resolve) => { setTimeout(resolve, ms); });
 
+test('a process holding for background work is kept up to the ceiling, an idle one only for the idle allowance', async () => {
+  const session = new HeldClaudeSession({
+    sessionKey: 'session-9',
+    fingerprint: fingerprint(),
+    idleMs: 40,
+    backgroundWorkCeilingMs: 400,
+  });
+  const driven = drivenQuery(session);
+  session.start(driven.instance, () => {});
+
+  // The turn reports that it started background work which has not settled.
+  let holding = true;
+  const running = session.runTurn({
+    promptMessages: [{ text: 'start an agent' }],
+    onMessage: () => {},
+    isHoldingForBackgroundWork: () => holding,
+  });
+  driven.emit({ type: 'result', subtype: 'success' });
+  await running;
+
+  await sleep(120);
+  assert.equal(session.closed, false, 'well past the idle allowance, the process is still up for the work');
+
+  // The work reports in: the process pushes a follow-up turn. The handler of
+  // the last turn sees it and stops holding; the timer switches to idle.
+  holding = false;
+  driven.emit({ type: 'assistant', text: 'agent finished' });
+  driven.emit({ type: 'result', subtype: 'success' });
+  await sleep(100);
+  assert.equal(session.closed, true, 'nothing outstanding any more, so the idle allowance applies');
+  driven.end();
+});
+
+test('messages from the process push the idle countdown back out', async () => {
+  const session = new HeldClaudeSession({ sessionKey: 'session-10', fingerprint: fingerprint(), idleMs: 60 });
+  const driven = drivenQuery(session);
+  session.start(driven.instance, () => {});
+
+  const running = session.runTurn({ promptMessages: [{ text: 'one' }], onMessage: () => {} });
+  driven.emit({ type: 'result', subtype: 'success' });
+  await running;
+
+  // Silence is measured from the last message, not from the end of the turn.
+  for (let i = 0; i < 4; i += 1) {
+    await sleep(30);
+    driven.emit({ type: 'system', subtype: 'task_progress' });
+  }
+  assert.equal(session.closed, false, 'a process that keeps talking is not idle');
+
+  await sleep(120);
+  assert.equal(session.closed, true, 'and once it goes quiet, it is let go');
+  driven.end();
+});
+
 test('what the process pushes between turns reaches the handler of the last turn', async () => {
   const session = new HeldClaudeSession({ sessionKey: 'session-11', fingerprint: fingerprint() });
   const driven = drivenQuery(session);
