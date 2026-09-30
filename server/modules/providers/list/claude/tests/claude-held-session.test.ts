@@ -1,12 +1,16 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { HeldClaudeSession } from '@/modules/providers/list/claude/claude-held-session.js';
+import {
+  HeldClaudeSession,
+  getHeldSession,
+  holdSession,
+} from '@/modules/providers/list/claude/claude-held-session.js';
 
 type Fingerprint = {
   cwd: string;
   mcp: string;
-  tools: string;
+  disallowedTools: string;
   effort: string;
   model: string;
   permissionMode: string;
@@ -18,7 +22,7 @@ const writer = { name: 'writer' };
 const fingerprint = (overrides: Partial<Fingerprint> = {}): Fingerprint => ({
   cwd: '/workspace',
   mcp: '{"chrome-tabs":{"command":"claude"}}',
-  tools: '{"allowed":[],"disallowed":[]}',
+  disallowedTools: '[]',
   effort: 'high',
   model: 'opus',
   permissionMode: 'default',
@@ -75,12 +79,18 @@ test('a turn is only handed to a process started with what it needs', () => {
   assert.equal(session.matches(fingerprint()), true, 'same startup conditions');
   assert.equal(session.matches(fingerprint({ cwd: '/elsewhere' })), false, 'other project');
   assert.equal(session.matches(fingerprint({ mcp: '' })), false, 'other mcp servers');
-  assert.equal(
-    session.matches(fingerprint({ tools: '{"allowed":["Bash"],"disallowed":[]}' })),
-    false,
-    'other tool policy',
-  );
+  // The CLI refuses disallowed tools itself, from the list it was started
+  // with, so a different list needs a different process. The allowed list is
+  // not compared at all: `canUseTool` reads it live (see `applyAllowedTools`).
+  assert.equal(session.matches(fingerprint({ disallowedTools: '["Write"]' })), false, 'other disallowed tools');
   assert.equal(session.matches(fingerprint({ effort: 'xhigh' })), false, 'other effort');
+  // And it can say which of them differ, for the runtime's log line.
+  assert.deepEqual(session.mismatches(fingerprint()), []);
+  assert.deepEqual(
+    session.mismatches(fingerprint({ cwd: '/elsewhere', effort: 'xhigh', model: 'sonnet' })),
+    ['cwd', 'effort'],
+    'only what is fixed at startup is reported',
+  );
   // Every run brings a writer of its own (another tab, another device, or
   // just the next message); the session's relay follows it instead of the
   // process being started over.
@@ -368,4 +378,72 @@ test('the writer relay follows each turn', async () => {
   assert.equal(session.writer.userId, 'u2');
 
   session.close();
+});
+
+test('a replaced process that ends later does not unregister its replacement', async () => {
+  // The old process is closed when the new one is registered under the same
+  // key, but it only ends once its CLI has actually exited - after the new
+  // one is in the registry. Its end must clean up itself, not the key.
+  const first = new HeldClaudeSession({ sessionKey: 'session-13', fingerprint: fingerprint() });
+  const firstDriven = drivenQuery(first);
+  first.start(firstDriven.instance, () => {});
+  holdSession(first);
+
+  const second = new HeldClaudeSession({ sessionKey: 'session-13', fingerprint: fingerprint({ cwd: '/elsewhere' }) });
+  const secondDriven = drivenQuery(second);
+  second.start(secondDriven.instance, () => {});
+  holdSession(second);
+  assert.equal(first.closed, true, 'registering the replacement closes the old one');
+  assert.equal(getHeldSession('session-13'), second);
+
+  // Now the old CLI exits.
+  firstDriven.end();
+  await sleep(5);
+  assert.equal(getHeldSession('session-13'), second, 'the replacement is still registered');
+  assert.equal(second.closed, false);
+
+  // And closing a stale handle to the old one is equally harmless.
+  first.close();
+  assert.equal(getHeldSession('session-13'), second);
+
+  second.close();
+  secondDriven.end();
+});
+
+/** A driven query that also records whether the SDK was asked to close (terminate) the process. */
+function terminableQuery(session: HeldClaudeSession) {
+  const driven = drivenQuery(session);
+  let terminated = 0;
+  const instance = Object.assign(driven.instance, {
+    close: () => {
+      terminated += 1;
+      driven.end();
+    },
+  });
+  return { ...driven, instance, terminated: () => terminated };
+}
+
+test('a closed process that does not exit by itself is terminated after the grace', async () => {
+  // Ending stdin is not enough: a CLI holding background agents waits for
+  // them (up to its ceiling) with no way left to ask for permissions, then
+  // fails their follow-up turns straight into the transcript.
+  const session = new HeldClaudeSession({ sessionKey: 'session-14', fingerprint: fingerprint(), exitGraceMs: 30 });
+  const query = terminableQuery(session);
+  session.start(query.instance, () => {});
+
+  session.close();
+  assert.equal(query.terminated(), 0, 'first the process gets its chance to exit');
+  await sleep(60);
+  assert.equal(query.terminated(), 1, 'then it is terminated');
+});
+
+test('a closed process that exits on its own is left alone', async () => {
+  const session = new HeldClaudeSession({ sessionKey: 'session-15', fingerprint: fingerprint(), exitGraceMs: 30 });
+  const query = terminableQuery(session);
+  session.start(query.instance, () => {});
+
+  session.close();
+  query.end();
+  await sleep(60);
+  assert.equal(query.terminated(), 0, 'nothing to terminate: it exited within the grace');
 });

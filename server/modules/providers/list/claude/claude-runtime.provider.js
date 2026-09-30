@@ -922,19 +922,13 @@ async function queryClaudeSDK(command, options = {}, turnWriter, context) {
   let assistantBudgetSent = false;
 
   // Whether this conversation keeps one process across its turns instead of
-  // starting a fresh one per message.
+  // starting a fresh one per message. The chat gateway resolves the tool
+  // policy against the user's server-side preferences before the turn gets
+  // here, so every device sees the same answer.
   const keepSessionAlive = Boolean(options.toolsSettings?.keepSessionAlive);
   // An edited message rewinds the conversation, and a rewind is a startup
   // option (`resume` + `resumeSessionAt`): only a fresh process can do it.
   const rewindsConversation = Boolean(options.resumeAnchorId || options.resumeFromScratch);
-
-  // A new turn supersedes any earlier one still holding this session's process
-  // open, so held runs cannot stack up across a conversation. A process being
-  // kept for this very conversation is the exception - releasing it here would
-  // undo the point of holding it.
-  if (sessionKey() && !(keepSessionAlive && getHeldSession(sessionKey()))) {
-    getSession(sessionKey())?.releaseInput?.();
-  }
 
   // Hoisted above the try so the catch's cleanup can tell whether this run
   // still owns the activeSessions entry (or was superseded by a newer run).
@@ -991,6 +985,26 @@ async function queryClaudeSDK(command, options = {}, turnWriter, context) {
     }
   };
 
+  // A held process this turn cannot use is ended here, explicitly and by
+  // instance: its registry entry goes only if it is still its own, so a
+  // process that has already been replaced cannot take its replacement's
+  // entry with it. Doing this before `addSession` also keeps `addSession`
+  // from sending the old process an interrupt it can no longer answer.
+  const retireHeldProcess = (session) => {
+    session.close();
+    if (getSession(session.sessionKey)?.instance === session.instance) {
+      removeSession(session.sessionKey);
+    }
+  };
+
+  // One line per turn on how the process was chosen, so a device switch or
+  // a settings change that costs a process can be read off the log.
+  const logHeldDecision = (decision, previous, mismatches = []) => {
+    const previousNote = previous ? `previous=held(age=${previous.ageSeconds ?? '?'}s)` : 'previous=none';
+    const mismatchNote = mismatches.length > 0 ? ` mismatch=${mismatches.join(',')}` : '';
+    console.log(`[Claude SDK] held: session=${sessionKey()} keepSessionAlive=${keepSessionAlive} policy=${options.toolsSettingsSource || 'client'} ${previousNote} decision=${decision}${mismatchNote}`);
+  };
+
   try {
     const resolvedModel = await context.resolveResumeModel(sessionId, options.model);
     let effortModels = CLAUDE_PREDEFINED_MODELS;
@@ -1026,15 +1040,13 @@ async function queryClaudeSDK(command, options = {}, turnWriter, context) {
       // name but changes command, url, arguments or environment is a different
       // server, and the running process still has the old one.
       mcp: stableJson(mcpServers || {}),
-      // The policy the user set, not the list handed to the CLI: plan mode
-      // adds its own read-only tools, and the mode is switched on the live
-      // process. Comparing the full list would start a new process for every
-      // step into a plan and back out of it - `applyTurn` moves those entries
-      // over instead.
-      tools: stableJson({
-        allowed: options.toolsSettings?.allowedTools || [],
-        disallowed: options.toolsSettings?.disallowedTools || [],
-      }),
+      // Only the disallowed list: the CLI takes it at startup and refuses
+      // those tools itself, before `canUseTool` is asked. The allowed list is
+      // not here on purpose - `canUseTool` reads it from the options at call
+      // time, so `applyTurn` can change it on the live process, and a rule
+      // remembered mid-conversation or a step into plan mode must not cost
+      // the conversation its process (and its background work).
+      disallowedTools: stableJson(options.toolsSettings?.disallowedTools || []),
       effort: sdkOptions.effort || '',
       model: sdkOptions.model || '',
       permissionMode: sdkOptions.permissionMode || 'default',
@@ -1042,8 +1054,30 @@ async function queryClaudeSDK(command, options = {}, turnWriter, context) {
 
     // Decided before the callbacks below are built, so that they capture the
     // held session's writer relay rather than this one turn's writer.
-    const reusable = keepSessionAlive && !rewindsConversation ? getHeldSession(sessionKey()) : null;
-    if (reusable && reusable.matches(fingerprint)) {
+    const previous = getHeldSession(sessionKey());
+    const mismatches = previous && keepSessionAlive && !rewindsConversation ? previous.mismatches(fingerprint) : [];
+    const reusable = previous && keepSessionAlive && !rewindsConversation && previous.matches(fingerprint) ? previous : null;
+    if (!reusable && sessionKey()) {
+      if (previous) {
+        // A held process this turn cannot continue on. It is ended for good:
+        // left alone it would outlive its stdin on its background agents and
+        // then fail their follow-up turns into the shared transcript.
+        retireHeldProcess(previous);
+      } else {
+        // A one-shot process an earlier turn is still holding open for its
+        // background work: a new turn supersedes it, as it always has.
+        getSession(sessionKey())?.releaseInput?.();
+      }
+    }
+    if (reusable) {
+      logHeldDecision('reused', previous);
+    } else if (keepSessionAlive && !rewindsConversation) {
+      logHeldDecision('new', previous, mismatches);
+    } else {
+      logHeldDecision(rewindsConversation ? 'off(rewind)' : 'off', previous);
+    }
+
+    if (reusable) {
       // Claimed before anything is applied. `applyTurn` sets the model and the
       // permission mode on the live process and writes the tool list into the
       // options the running turn reads from, so a turn that did all that and

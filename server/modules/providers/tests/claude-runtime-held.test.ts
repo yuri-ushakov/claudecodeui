@@ -24,14 +24,25 @@ import type { AnyRecord, NormalizedMessage, ProviderRuntimeContext } from '@/sha
 
 const NATIVE_ID = 'native-held-session';
 
-type Scripted = {
+/** One scripted CLI process: what it was started with, what it emits, and how it was ended. */
+type ScriptedProcess = {
   emit: (message: Record<string, unknown>) => void;
   end: () => void;
+  /** Whether the host ended its stdin. */
   released: () => boolean;
+  /** How many times the host asked the SDK to interrupt it. */
+  interrupts: () => number;
+  /** Whether the host closed (terminated) it through the SDK. */
+  terminated: () => boolean;
+  /** The options it was started with; its callbacks live here. */
+  options: () => AnyRecord;
+};
+
+type Scripted = ScriptedProcess & {
   /** How many processes were started. */
   starts: () => number;
-  /** The options the (first) process was started with; its callbacks live here. */
-  options: () => AnyRecord;
+  /** The n-th process started (0-based); the bare accessors above address the latest. */
+  process: (index: number) => ScriptedProcess;
 };
 
 type Writer = { send: (message: NormalizedMessage) => void; userId: null; received: NormalizedMessage[] };
@@ -43,23 +54,16 @@ function createWriter(): Writer {
 
 /** A stand-in for the SDK query that keeps reading the prompt stream for as long as it is open. */
 function createScriptedQuery(): { createQuery: NonNullable<ProviderRuntimeContext['createQuery']>; script: Scripted } {
-  const queue: Array<Record<string, unknown> | null> = [];
-  let wake: (() => void) | null = null;
-  let released = false;
-  let starts = 0;
-  let startedWith: AnyRecord = {};
-
-  const script: Scripted = {
-    emit: (message) => { queue.push(message); wake?.(); },
-    end: () => { queue.push(null); wake?.(); },
-    released: () => released,
-    starts: () => starts,
-    options: () => startedWith,
-  };
+  const processes: ScriptedProcess[] = [];
+  const latest = () => processes[processes.length - 1];
 
   const createQuery: NonNullable<ProviderRuntimeContext['createQuery']> = ({ prompt, options }) => {
-    starts += 1;
-    startedWith = options;
+    const queue: Array<Record<string, unknown> | null> = [];
+    let wake: (() => void) | null = null;
+    let released = false;
+    let interrupts = 0;
+    let terminated = false;
+
     void (async () => {
       for await (const _message of prompt) { /* the CLI reads its stdin */ }
       released = true;
@@ -80,12 +84,34 @@ function createScriptedQuery(): { createQuery: NonNullable<ProviderRuntimeContex
       }
     })();
 
+    const process: ScriptedProcess = {
+      emit: (message) => { queue.push(message); wake?.(); },
+      end: () => { queue.push(null); wake?.(); },
+      released: () => released,
+      interrupts: () => interrupts,
+      terminated: () => terminated,
+      options: () => options,
+    };
+    processes.push(process);
+
     return Object.assign(iterator, {
-      interrupt: async () => {},
+      interrupt: async () => { interrupts += 1; },
       stopTask: async () => {},
       setModel: async () => {},
       setPermissionMode: async () => {},
+      close: () => { terminated = true; process.end(); },
     });
+  };
+
+  const script: Scripted = {
+    emit: (message) => latest().emit(message),
+    end: () => latest()?.end(),
+    released: () => latest().released(),
+    interrupts: () => latest().interrupts(),
+    terminated: () => latest().terminated(),
+    options: () => latest().options(),
+    starts: () => processes.length,
+    process: (index) => processes[index],
   };
 
   return { createQuery, script };
@@ -93,9 +119,10 @@ function createScriptedQuery(): { createQuery: NonNullable<ProviderRuntimeContex
 
 type Harness = {
   script: Scripted;
-  /** Starts a turn on its own writer, as a fresh `chat.send` would. */
-  turn: (writer: Writer, command?: string) => Promise<unknown>;
+  /** Starts a turn on its own writer, as a fresh `chat.send` would; `overrides` change what the turn asks for. */
+  turn: (writer: Writer, command?: string, overrides?: AnyRecord) => Promise<unknown>;
   sessionId: string;
+  cwd: string;
 };
 
 async function withConversation(
@@ -113,18 +140,20 @@ async function withConversation(
     isProviderInstalled: async () => true,
     createQuery,
   };
-  const turn = (writer: Writer, command = 'hello') => queryClaudeSDK(
+  const turn = (writer: Writer, command = 'hello', overrides: AnyRecord = {}) => queryClaudeSDK(
     command,
-    { sessionId, cwd, toolsSettings: { keepSessionAlive: true } },
+    { sessionId, cwd, ...overrides, toolsSettings: { keepSessionAlive: true, ...(overrides.toolsSettings ?? {}) } },
     writer as never,
     context,
   );
 
   try {
-    await runTest({ script, turn, sessionId });
+    await runTest({ script, turn, sessionId, cwd });
   } finally {
     releaseHeldSession(sessionId);
-    script.end();
+    for (let index = 0; index < script.starts(); index += 1) {
+      script.process(index).end();
+    }
     await settle();
     await rm(cwd, { recursive: true, force: true });
   }
@@ -289,4 +318,93 @@ test('with the option off, every turn is its own process as before', async () =>
   } finally {
     await rm(cwd, { recursive: true, force: true });
   }
+});
+
+test('a turn the held process cannot serve ends it for good and gets a working permission channel on the new one', async () => {
+  await withConversation('app-held-replaced', async ({ script, turn, sessionId }) => {
+    const station = createWriter();
+    const first = turn(station);
+    await settle();
+    script.emit(init());
+    script.emit(toolUse('toolu_agent', 'Agent', { prompt: 'work for a while', run_in_background: true }));
+    script.emit(taskStarted('a1', 'toolu_agent', 'local_agent'));
+    script.emit(ack('toolu_agent', 'Agent launched in background. Task ID: a1', { status: 'async_launched', taskId: 'a1' }));
+    script.emit(result());
+    await first;
+    const old = script.process(0);
+
+    // The next message needs another working directory: the CLI fixed that
+    // at startup, so this turn cannot go into the same process.
+    const tablet = createWriter();
+    const otherCwd = await mkdtemp(path.join(os.tmpdir(), 'claude-runtime-held-other-'));
+    try {
+      const second = turn(tablet, 'from elsewhere', { cwd: otherCwd });
+      await settle();
+
+      assert.equal(script.starts(), 2, 'a second process was started');
+      assert.equal(old.released(), true, 'the old process had its stdin ended');
+      assert.equal(old.interrupts(), 0, 'and was not sent an interrupt it could no longer answer');
+      assert.equal(getHeldSession(sessionId)?.fingerprint.cwd, otherCwd, 'the new process is the one held now');
+      assert.deepEqual(listClaudeSDKBackgroundWork(), [], 'the old process\'s work is no longer tracked: it died with it');
+
+      const fresh = script.process(1);
+      assert.equal(fresh.released(), false, 'the new process\'s stdin is open');
+
+      // Its permission channel works: `canUseTool` reaches the writer of the
+      // turn being served, and the answer goes back.
+      const canUseTool = fresh.options().canUseTool as (
+        toolName: string, input: unknown, context: unknown,
+      ) => Promise<{ behavior: string }>;
+      const decision = canUseTool('Bash', { command: 'uname' }, {});
+      await settle();
+      const request = tablet.received.find((message) => message.kind === 'permission_request');
+      assert.ok(request, 'the prompt lands on the new turn\'s writer');
+      resolveToolApproval(request.requestId as string, { allow: true });
+      assert.equal((await decision).behavior, 'allow');
+      assert.equal(fresh.released(), false, 'still open after the request');
+
+      // Meanwhile the old process, which did not exit on its own, is ended
+      // properly rather than left waiting on its agent with no stdin - and
+      // that ending does not touch the new process.
+      await new Promise((resolve) => { setTimeout(resolve, 5200); });
+      assert.equal(old.terminated(), true, 'the old process was terminated after its grace');
+      assert.equal(fresh.released(), false, 'the new process is untouched');
+      assert.equal(getHeldSession(sessionId)?.fingerprint.cwd, otherCwd, 'and still registered');
+
+      fresh.emit(result());
+      await second;
+    } finally {
+      await rm(otherCwd, { recursive: true, force: true });
+    }
+  });
+});
+
+test('a changed allowed-tool list is applied to the held process instead of costing a new one', async () => {
+  await withConversation('app-held-allowed', async ({ script, turn, sessionId }) => {
+    const station = createWriter();
+    const first = turn(station, 'hello', { toolsSettings: { allowedTools: ['Bash(git:*)'] } });
+    await settle();
+    script.emit(init());
+    script.emit(result());
+    await first;
+
+    // The user remembered a rule (or another device already had it).
+    const tablet = createWriter();
+    const second = turn(tablet, 'again', { toolsSettings: { allowedTools: ['Bash(git:*)', 'Bash(ls:*)'] } });
+    await settle();
+
+    assert.equal(script.starts(), 1, 'same process');
+    assert.deepEqual(script.options().allowedTools, ['Bash(git:*)', 'Bash(ls:*)'], 'the list the callback reads was updated');
+    assert.ok(getHeldSession(sessionId), 'the process is still held');
+    script.emit(result());
+    await second;
+
+    // A changed disallowed list is different: the CLI enforces it from
+    // startup, so it does need a new process.
+    const third = turn(tablet, 'once more', { toolsSettings: { disallowedTools: ['Write'] } });
+    await settle();
+    assert.equal(script.starts(), 2, 'a disallowed-tool change starts a new process');
+    script.emit(result());
+    await third;
+  });
 });

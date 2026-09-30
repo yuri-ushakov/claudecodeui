@@ -30,9 +30,18 @@
  *   ceiling the one-shot hold in the runtime uses as its backstop.
  *
  * What cannot change is what the CLI fixed at startup: the working directory,
- * the MCP servers, the tool policy, the effort. A turn that needs different
- * ones gets a new process; `matches()` decides that. Model and permission mode
- * do change live, through the SDK's own `setModel` / `setPermissionMode`.
+ * the MCP servers, the disallowed tools, the effort. A turn that needs
+ * different ones gets a new process; `matches()` decides that. Model,
+ * permission mode and the allowed-tool list do change live, through the SDK's
+ * own `setModel` / `setPermissionMode` and the options `canUseTool` reads.
+ *
+ * Letting a process go is two steps, because ending its stdin is not enough:
+ * the CLI keeps running after EOF for as long as it has background agents
+ * (up to the ceiling it was started with) and then serves their follow-up
+ * turns with no way to ask for permissions - a zombie that writes into the
+ * transcript and fails every tool. So `close()` ends stdin and, when the
+ * process has not exited on its own within a short grace, closes it through
+ * the SDK, which terminates it.
  */
 
 /**
@@ -52,6 +61,17 @@ const heldSessions = new Map();
 
 /** How long a session may sit idle, with nothing outstanding, before its process is let go. */
 const DEFAULT_IDLE_MS = 10 * 60 * 1000;
+
+/**
+ * How long a process gets to exit on its own after its stdin was ended before
+ * it is terminated. A CLI with nothing outstanding is gone well within this;
+ * one that is waiting for background agents would otherwise stay for the
+ * whole background-work ceiling.
+ */
+const DEFAULT_EXIT_GRACE_MS = 5000;
+
+/** The startup conditions `matches()` compares, in the order they are reported. */
+const FIXED_AT_STARTUP = ['cwd', 'mcp', 'effort', 'disallowedTools'];
 
 /**
  * The writer of whichever turn was served last.
@@ -124,6 +144,7 @@ export class HeldClaudeSession {
    * @param {Object|null} [args.writer] - Writer of the turn that starts the process
    * @param {number} [args.idleMs] - Idle time, with nothing outstanding, before the process is released
    * @param {number} [args.backgroundWorkCeilingMs] - Idle time while background work is outstanding
+   * @param {number} [args.exitGraceMs] - Time a closed process gets to exit by itself before it is terminated
    * @param {(session: HeldClaudeSession, error: Error|null) => void} [args.onEnd] - Called once the process has ended
    */
   constructor({
@@ -132,13 +153,17 @@ export class HeldClaudeSession {
     writer = null,
     idleMs = DEFAULT_IDLE_MS,
     backgroundWorkCeilingMs = DEFAULT_IDLE_MS,
+    exitGraceMs = DEFAULT_EXIT_GRACE_MS,
     onEnd = () => {},
   }) {
     this.sessionKey = sessionKey;
     this.fingerprint = fingerprint;
     this.idleMs = idleMs;
     this.backgroundWorkCeilingMs = backgroundWorkCeilingMs;
+    this.exitGraceMs = exitGraceMs;
     this.onEnd = onEnd;
+    /** When the process was attached, for the runtime's diagnostics. */
+    this.startedAt = null;
 
     /** Where everything this process emits goes: the writer of the latest turn. */
     this.writer = new LatestTurnWriter(writer);
@@ -163,6 +188,8 @@ export class HeldClaudeSession {
     this.wake = null;
     this.closed = false;
     this.idleTimer = null;
+    /** Armed by `close()`: terminates the process if it has not exited by then. */
+    this.exitTimer = null;
     /** Set while a turn is being served, so a second one cannot cut in. */
     this.busy = false;
   }
@@ -237,12 +264,11 @@ export class HeldClaudeSession {
   /**
    * Puts this turn's tool list into the options the callback reads.
    *
-   * The user's own policy is part of the fingerprint, so within one held
-   * process it never changes; what does is what the permission mode adds -
-   * plan mode brings its read-only set along. Were that difference left in the
-   * fingerprint, every step into plan mode and back would cost a new process,
-   * and were it ignored here, `canUseTool` would ask about every Read the plan
-   * makes.
+   * The allowed list is applied here rather than compared by `matches()`: it
+   * is consulted by `canUseTool` at call time, so a changed one takes effect
+   * on the live process at no cost, whereas a process per change would end
+   * the conversation's background work every time a rule is remembered or
+   * plan mode adds its read-only set.
    *
    * Entries the callback remembered mid-conversation are in neither list, so
    * they are carried over rather than dropped.
@@ -328,9 +354,11 @@ export class HeldClaudeSession {
   /**
    * Whether this process was started with what the next turn needs.
    *
-   * Only what the CLI fixes at startup is compared. Model and permission mode
-   * are deliberately absent: they are set live by `applyTurn`. The writer is
-   * absent too: every run brings its own, and the relay follows it.
+   * Only what the CLI fixes at startup is compared - see `mismatches`. Model
+   * and permission mode are deliberately absent: they are set live by
+   * `applyTurn`. The allowed-tool list is absent too: `applyAllowedTools`
+   * puts it where `canUseTool` reads it. So is the writer: every run brings
+   * its own, and the relay follows it.
    *
    * @param {Object} fingerprint - What the next turn would start a process with
    * @returns {boolean}
@@ -338,15 +366,25 @@ export class HeldClaudeSession {
   matches(fingerprint) {
     return !this.closed
       && this.instance !== null
-      && this.fingerprint.cwd === fingerprint.cwd
-      && this.fingerprint.mcp === fingerprint.mcp
-      // Effort has no live setter on the SDK.
-      && this.fingerprint.effort === fingerprint.effort
-      // The tool policy decides what `canUseTool` lets through, and that
-      // callback was built around the first turn's options. Rather than run a
-      // turn under a policy that is no longer the user's, a changed one gets
-      // its own process.
-      && this.fingerprint.tools === fingerprint.tools;
+      && this.mismatches(fingerprint).length === 0;
+  }
+
+  /**
+   * The startup conditions on which this process and the next turn disagree.
+   *
+   * - `cwd` and `mcp`: the CLI resolves both when it starts.
+   * - `effort`: the SDK has no live setter for it.
+   * - `disallowedTools`: handed to the CLI at startup, and the CLI refuses
+   *   those tools itself, before ever asking `canUseTool` - so a process
+   *   started with one list cannot be made to honour another.
+   *
+   * Reported by name so the runtime can say why a process was not reused.
+   *
+   * @param {Object} fingerprint - What the next turn would start a process with
+   * @returns {string[]} Names of the differing conditions; empty when it fits
+   */
+  mismatches(fingerprint) {
+    return FIXED_AT_STARTUP.filter((field) => this.fingerprint[field] !== fingerprint[field]);
   }
 
   // ------------------------------------------------------ process lifetime
@@ -400,9 +438,15 @@ export class HeldClaudeSession {
     this.instance = instance;
     this.release = release;
     this.sdkOptions = sdkOptions;
+    this.startedAt = Date.now();
     /** What the last turn put there; anything beyond it was remembered live. */
     this.appliedAllowedTools = [...(sdkOptions?.allowedTools || [])];
     this.consume();
+  }
+
+  /** Seconds since the process was attached, for diagnostics; null before `start`. */
+  get ageSeconds() {
+    return this.startedAt === null ? null : Math.round((Date.now() - this.startedAt) / 1000);
   }
 
   /**
@@ -430,10 +474,22 @@ export class HeldClaudeSession {
     } finally {
       this.closed = true;
       this.clearIdle();
-      heldSessions.delete(this.sessionKey);
+      this.clearExit();
+      this.unregister();
       this.turn?.onError(new Error('The held Claude process ended.'));
       this.turn = null;
       this.onEnd(this, failure);
+    }
+  }
+
+  /**
+   * Takes this session out of the registry - only if the registry still
+   * points at it. A replaced process ends after its replacement was
+   * registered under the same key, and must not take that entry with it.
+   */
+  unregister() {
+    if (heldSessions.get(this.sessionKey) === this) {
+      heldSessions.delete(this.sessionKey);
     }
   }
 
@@ -467,7 +523,15 @@ export class HeldClaudeSession {
     this.idleTimer.unref?.();
   }
 
-  /** Ends the prompt stream, which closes stdin and lets the CLI exit. */
+  /**
+   * Lets the process go: ends the prompt stream, which closes stdin, and
+   * terminates the process if it is still there once the grace has passed.
+   *
+   * The grace lets a CLI with nothing outstanding wind down on its own; the
+   * termination is for one that would otherwise sit on its background agents
+   * with no stdin to ask permissions through, then serve their follow-up
+   * turns as failures straight into the transcript.
+   */
   close() {
     if (this.closed) {
       return;
@@ -475,10 +539,35 @@ export class HeldClaudeSession {
 
     this.closed = true;
     this.clearIdle();
-    heldSessions.delete(this.sessionKey);
+    this.unregister();
     // Wakes the prompt stream so it can end, which closes stdin.
     this.wake?.();
     this.release();
+    this.scheduleExit();
+  }
+
+  /** Arms the termination that `close()` falls back to. */
+  scheduleExit() {
+    if (typeof this.instance?.close !== 'function') {
+      return;
+    }
+    this.exitTimer = setTimeout(() => {
+      this.exitTimer = null;
+      try {
+        this.instance.close();
+      } catch (error) {
+        console.error(`[Claude SDK] Could not terminate the held process for session ${this.sessionKey}:`, error?.message || error);
+      }
+    }, this.exitGraceMs);
+    this.exitTimer.unref?.();
+  }
+
+  /** Cancels the pending termination: the process ended by itself. */
+  clearExit() {
+    if (this.exitTimer) {
+      clearTimeout(this.exitTimer);
+      this.exitTimer = null;
+    }
   }
 }
 
