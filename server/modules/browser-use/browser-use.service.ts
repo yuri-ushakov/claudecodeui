@@ -9,46 +9,35 @@ import spawn from 'cross-spawn';
 
 import { appConfigDb } from '@/modules/database/index.js';
 import { providerMcpService } from '@/modules/providers/index.js';
-import { getModuleDirectory } from '@/shared/utils.js';
+import { findApplicationRoot, getModuleDirectory } from '@/shared/utils.js';
 
+import {
+  buildBrowserLaunchOptions,
+  isBrowserExecutableInstalled,
+  readBrowserLaunchConfig,
+  resolveBrowserExecutablePath,
+} from './browser-launch.js';
+import {
+  agentScreenshotView,
+  agentSessionView,
+  agentSnapshotView,
+  publicSessionView,
+  type BrowserSessionState,
+} from './browser-session-views.js';
 import { getBrowserUseRuntime } from './browser-use-runtime.js';
 
 const require = createRequire(import.meta.url);
 const __dirname = getModuleDirectory(import.meta.url);
+// Корень приложения (где package.json и node_modules CloudCLI): сюда ставится
+// пакет playwright, и отсюда же его резолвит require — иначе установка уходит в
+// cwd процесса (WorkingDirectory юнита), и сервер пакет не видит.
+const APP_ROOT = findApplicationRoot(__dirname);
 const MAX_SESSIONS_PER_OWNER = Number.parseInt(process.env.CLOUDCLI_BROWSER_USE_MAX_SESSIONS_PER_OWNER || '3', 10);
 const SESSION_TTL_MS = Number.parseInt(process.env.CLOUDCLI_BROWSER_USE_SESSION_TTL_MS || String(30 * 60 * 1000), 10);
 const BROWSER_USE_SETTINGS_KEY = 'browser_use_settings';
 const BROWSER_USE_MCP_TOKEN_KEY = 'browser_use_mcp_token';
 
-type BrowserUseRuntime = ReturnType<typeof getBrowserUseRuntime>;
-type BrowserUseSessionStatus = 'ready' | 'stopped' | 'unavailable';
-
-type BrowserUseSession = {
-  id: string;
-  ownerId: string;
-  createdBy: 'agent';
-  runtime: BrowserUseRuntime;
-  status: BrowserUseSessionStatus;
-  url: string | null;
-  title: string | null;
-  screenshotDataUrl: string | null;
-  createdAt: string;
-  updatedAt: string;
-  lastAction: string | null;
-  message: string | null;
-  profileName: string | null;
-  viewport: {
-    width: number;
-    height: number;
-  } | null;
-  cursor: {
-    x: number;
-    y: number;
-    actor: 'agent';
-  } | null;
-};
-
-type PublicBrowserUseSession = Omit<BrowserUseSession, 'ownerId'>;
+type BrowserUseSession = BrowserSessionState;
 
 type RuntimeHandle = {
   browser?: any;
@@ -63,6 +52,10 @@ type BrowserUseSettings = {
 type RuntimeReadiness = {
   playwright: any | null;
   playwrightInstalled: boolean;
+  /** Канал браузера, который будет запущен (`chromium`, `chrome`, …). */
+  channel: string;
+  headless: boolean;
+  /** Браузер выбранного канала есть на диске. Имя поля историческое — его читает клиент. */
   chromiumInstalled: boolean;
   chromiumExecutablePath: string | null;
   installInProgress: boolean;
@@ -132,7 +125,9 @@ function getSetupMessage(settings: BrowserUseSettings, readiness: RuntimeReadine
   }
 
   if (!readiness.chromiumInstalled) {
-    return 'Playwright is installed, but Chromium is missing. Install the Chromium runtime to continue.';
+    return readiness.channel === 'chromium'
+      ? 'Playwright is installed, but Chromium is missing. Install the Chromium runtime to continue.'
+      : `Playwright is installed, but the "${readiness.channel}" browser channel (CLOUDCLI_BROWSER_USE_CHANNEL) is not installed on this machine.`;
   }
 
   return readiness.installMessage || 'Browser runtime is not ready.';
@@ -192,11 +187,18 @@ function getProfilePath(profileName: string): string {
   return path.join(PROFILE_ROOT, safeName);
 }
 
+/**
+ * Проверяет рантайм: пакет playwright доступен из каталога приложения и на диске
+ * есть браузер того канала, который реально будет запущен (`readBrowserLaunchConfig`).
+ */
 function probeRuntime(): RuntimeProbe {
   const playwright = getPlaywright();
+  const launchConfig = readBrowserLaunchConfig();
   const readiness: RuntimeProbe = {
     playwright,
     playwrightInstalled: Boolean(playwright),
+    channel: launchConfig.channel,
+    headless: launchConfig.headless,
     chromiumInstalled: false,
     chromiumExecutablePath: null,
   };
@@ -205,14 +207,9 @@ function probeRuntime(): RuntimeProbe {
     return readiness;
   }
 
-  try {
-    const executablePath = playwright.chromium.executablePath();
-    readiness.chromiumExecutablePath = executablePath;
-    readiness.chromiumInstalled = Boolean(executablePath && fs.existsSync(executablePath));
-  } catch {
-    readiness.chromiumInstalled = false;
-  }
-
+  const executablePath = resolveBrowserExecutablePath(playwright, launchConfig);
+  readiness.chromiumExecutablePath = executablePath;
+  readiness.chromiumInstalled = isBrowserExecutableInstalled(executablePath);
   return readiness;
 }
 
@@ -241,10 +238,14 @@ const INSTALL_COMMAND_TIMEOUT_MS = Number.parseInt(
   10,
 );
 
+/**
+ * Запускает команду установки в корне приложения (`APP_ROOT`) и собирает её вывод
+ * в текст ошибки. Таймаут — `CLOUDCLI_BROWSER_USE_INSTALL_TIMEOUT_MS`.
+ */
 function runCommand(command: string, args: string[]): Promise<void> {
   return new Promise((resolve, reject) => {
     const child = spawn(command, args, {
-      cwd: process.cwd(),
+      cwd: APP_ROOT,
       env: process.env,
       shell: false,
       stdio: ['ignore', 'pipe', 'pipe'],
@@ -286,10 +287,34 @@ function runCommand(command: string, args: string[]): Promise<void> {
 
 function formatInstallError(error: unknown): string {
   const message = error instanceof Error ? error.message : String(error);
-  if (message.includes('sudo') && message.includes('password')) {
-    return 'Installing Chromium system dependencies requires administrator privileges. Run `npx playwright install-deps chromium` on the machine where CloudCLI runs, then try again.';
-  }
   return message || 'Failed to install Browser runtime.';
+}
+
+/**
+ * Команда для ручной установки системных библиотек Chromium: тот же node, которым
+ * запущен сервер (важно при nvm — у root в PATH его нет), и CLI Playwright из
+ * каталога приложения, а не `npx` из случайного cwd.
+ */
+function installDepsCommand(): string {
+  const cli = path.join(APP_ROOT, 'node_modules', 'playwright', 'cli.js');
+  return `sudo ${process.execPath} ${cli} install-deps chromium`;
+}
+
+/**
+ * Шаг `install-deps`: в сервисе нет терминала для sudo, поэтому при любой ошибке
+ * сообщение содержит готовую команду для ручного запуска и исходный вывод.
+ */
+async function installSystemDependencies(npmCommand: string): Promise<void> {
+  try {
+    await runCommand(npmCommand, ['exec', '--', 'playwright', 'install-deps', 'chromium']);
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    throw new Error(
+      `Installing Chromium system dependencies needs administrator privileges, which the server does not have. `
+      + `Run on the machine where CloudCLI runs: \`${installDepsCommand()}\` — then click Install again. `
+      + `Output: ${detail}`,
+    );
+  }
 }
 
 async function installRuntime(): Promise<{ success: boolean; message: string }> {
@@ -306,7 +331,7 @@ async function installRuntime(): Promise<{ success: boolean; message: string }> 
 
       if (process.platform === 'linux') {
         lastInstallMessage = 'Installing Chromium system dependencies...';
-        await runCommand(npmCommand, ['exec', '--', 'playwright', 'install-deps', 'chromium']);
+        await installSystemDependencies(npmCommand);
       }
 
       lastInstallMessage = 'Installing Chromium runtime...';
@@ -343,11 +368,6 @@ function normalizeUrl(rawUrl: string): string {
   }
 
   return parsed.toString();
-}
-
-function publicSession(session: BrowserUseSession): PublicBrowserUseSession {
-  const { ownerId: _ownerId, ...publicFields } = session;
-  return publicFields;
 }
 
 function ownerSessions(ownerId: string): BrowserUseSession[] {
@@ -447,6 +467,8 @@ export const browserUseService = {
       available,
       playwrightInstalled: readiness.playwrightInstalled,
       chromiumInstalled: readiness.chromiumInstalled,
+      channel: readiness.channel,
+      headless: readiness.headless,
       installInProgress: readiness.installInProgress,
       sessionCount: sessions.size,
       message: available
@@ -491,11 +513,12 @@ export const browserUseService = {
     };
   },
 
+  /** Сессии для вкладки Browser — со скриншотом для превью. */
   async listSessions() {
     await expireStaleSessions();
     return [...sessions.values()]
       .filter((session) => session.ownerId === AGENT_OWNER_ID)
-      .map(publicSession);
+      .map(publicSessionView);
   },
 
   async createAgentSession(options?: { profileName?: string | null }) {
@@ -535,16 +558,13 @@ export const browserUseService = {
     if (!settings.enabled || !readiness.playwrightInstalled || !readiness.chromiumInstalled || !readiness.playwright) {
       session.message = getSetupMessage(settings, readiness);
       sessions.set(session.id, session);
-      return publicSession(session);
+      return agentSessionView(session);
     }
 
     let browser: any | undefined;
     let context: any | undefined;
     let page: any;
-    const launchOptions = {
-      headless: true,
-      args: ['--disable-dev-shm-usage'],
-    };
+    const launchOptions = buildBrowserLaunchOptions(readBrowserLaunchConfig());
     const contextOptions = {
       viewport: { width: 1440, height: 900 },
       serviceWorkers: 'block',
@@ -567,7 +587,7 @@ export const browserUseService = {
     sessions.set(session.id, session);
     handles.set(session.id, { browser, context, page });
     await captureSession(session, page);
-    return publicSession(session);
+    return agentSessionView(session);
   },
 
   async listAgentSessions() {
@@ -578,7 +598,7 @@ export const browserUseService = {
     await expireStaleSessions();
     return [...sessions.values()]
       .filter((session) => session.ownerId === AGENT_OWNER_ID)
-      .map(publicSession);
+      .map(agentSessionView);
   },
 
   async getAgentSession(sessionId: string) {
@@ -616,10 +636,14 @@ export const browserUseService = {
     session.lastAction = `navigate:${url}`;
     session.cursor = null;
     await captureSession(session, handle.page);
-    return publicSession(session);
+    return agentSessionView(session);
   },
 
-  async agentSnapshot(sessionId: string) {
+  /**
+   * Снимок страницы для агента: метаданные и видимый текст (до 30 000 символов);
+   * скриншот — только при `includeScreenshot`, чтобы не раздувать каждый ответ.
+   */
+  async agentSnapshot(sessionId: string, options: { includeScreenshot?: boolean } = {}) {
     const session = await this.getAgentSession(sessionId);
     const handle = handles.get(sessionId);
     if (!handle?.page) {
@@ -627,10 +651,20 @@ export const browserUseService = {
     }
     await captureSession(session, handle.page);
     const text = await handle.page.locator('body').innerText({ timeout: 5_000 }).catch(() => '');
-    return {
-      session: publicSession(session),
-      text: text.slice(0, 30_000),
-    };
+    return agentSnapshotView(session, text.slice(0, 30_000), options.includeScreenshot === true);
+  },
+
+  /**
+   * Свежий скриншот текущей страницы по явному запросу агента (`browser_take_screenshot`).
+   */
+  async agentScreenshot(sessionId: string) {
+    const session = await this.getAgentSession(sessionId);
+    const handle = handles.get(sessionId);
+    if (!handle?.page) {
+      throw new Error('Browser runtime handle is not available.');
+    }
+    await captureSession(session, handle.page);
+    return agentScreenshotView(session);
   },
 
   async agentClick(sessionId: string, input: { selector?: string; text?: string; x?: number; y?: number }) {
@@ -654,7 +688,7 @@ export const browserUseService = {
     session.lastAction = 'click';
     session.cursor = point ? { ...point, actor: 'agent' } : null;
     await captureSession(session, handle.page);
-    return publicSession(session);
+    return agentSessionView(session);
   },
 
   async agentType(sessionId: string, input: { selector?: string; text: string; submit?: boolean }) {
@@ -678,7 +712,7 @@ export const browserUseService = {
 
     session.lastAction = 'type';
     await captureSession(session, handle.page);
-    return publicSession(session);
+    return agentSessionView(session);
   },
 
   async agentFillForm(sessionId: string, fields: Array<{ selector: string; value: string }>) {
@@ -697,7 +731,7 @@ export const browserUseService = {
       ));
     }
     await captureSession(session, handle.page);
-    return publicSession(session);
+    return agentSessionView(session);
   },
 
   async agentPressKey(sessionId: string, key: string) {
@@ -709,7 +743,7 @@ export const browserUseService = {
     await handle.page.keyboard.press(key);
     session.lastAction = `press_key:${key}`;
     await captureSession(session, handle.page);
-    return publicSession(session);
+    return agentSessionView(session);
   },
 
   async agentSelectOption(sessionId: string, selector: string, values: string[]) {
@@ -724,7 +758,7 @@ export const browserUseService = {
       point ? { ...point, actor: 'agent' as const } : null
     ));
     await captureSession(session, handle.page);
-    return publicSession(session);
+    return agentSessionView(session);
   },
 
   async agentWaitFor(sessionId: string, input: { text?: string; url?: string; timeoutMs?: number }) {
@@ -743,7 +777,7 @@ export const browserUseService = {
     }
     session.lastAction = 'wait_for';
     await captureSession(session, handle.page);
-    return publicSession(session);
+    return agentSessionView(session);
   },
 
   async agentTabs(sessionId: string, input: { action?: 'list' | 'new' | 'select' | 'close'; index?: number; url?: string }) {
@@ -777,7 +811,7 @@ export const browserUseService = {
     const updatedHandle = handles.get(sessionId);
     await captureSession(session, updatedHandle?.page || handle.page);
     return {
-      session: publicSession(session),
+      session: agentSessionView(session),
       tabs: handle.context.pages().map((page: any, index: number) => ({
         index,
         url: page.url(),
@@ -798,7 +832,7 @@ export const browserUseService = {
     session.updatedAt = new Date().toISOString();
     session.lastAction = 'stop';
     session.message = 'Browser session stopped. Create a new session to continue browsing.';
-    return { stopped: true, session: publicSession(session) };
+    return { stopped: true, session: publicSessionView(session) };
   },
 
   async deleteSession(sessionId: string) {
@@ -813,8 +847,9 @@ export const browserUseService = {
   },
 
   async agentStopSession(sessionId: string) {
-    await this.getAgentSession(sessionId);
-    return this.stopSession(sessionId);
+    const session = await this.getAgentSession(sessionId);
+    const { stopped } = await this.stopSession(sessionId);
+    return { stopped, session: agentSessionView(session) };
   },
 
   async stopAllSessions() {

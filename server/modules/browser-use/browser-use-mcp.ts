@@ -86,12 +86,19 @@ const tools: ToolDefinition[] = [
   },
   {
     name: 'browser_snapshot',
-    description: 'Capture current page metadata, screenshot data URL, and visible body text for a Browser session.',
-    inputSchema: sessionIdSchema,
+    description: 'Capture current page metadata and visible body text for a Browser session. Set includeScreenshot to also return a screenshot data URL (large; off by default).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        sessionId: { type: 'string', description: 'Browser session id.' },
+        includeScreenshot: { type: 'boolean', description: 'Also return screenshotDataUrl (JPEG base64, ~100 KB). Default false.' },
+      },
+      required: ['sessionId'],
+    },
   },
   {
     name: 'browser_take_screenshot',
-    description: 'Capture the latest screenshot for a Browser session.',
+    description: 'Capture a fresh screenshot (JPEG data URL) of the current page. Other tools return metadata only; call this when you need to see the page.',
     inputSchema: sessionIdSchema,
   },
   {
@@ -226,7 +233,10 @@ async function callTool(name: string, args: Record<string, unknown>) {
     case 'browser_list_sessions':
       return jsonResponse(await callBrowserUseApi(name, {}));
     case 'browser_snapshot':
-      return jsonResponse(await callBrowserUseApi(name, { sessionId: readString(args.sessionId, 'sessionId') }));
+      return jsonResponse(await callBrowserUseApi(name, {
+        sessionId: readString(args.sessionId, 'sessionId'),
+        includeScreenshot: args.includeScreenshot === true,
+      }));
     case 'browser_take_screenshot': {
       return jsonResponse(await callBrowserUseApi(name, { sessionId: readString(args.sessionId, 'sessionId') }));
     }

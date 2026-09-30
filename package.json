@@ -254,6 +254,7 @@
   },
   "optionalDependencies": {
     "@nut-tree-fork/nut-js": "^4.2.6",
+    "playwright": "^1.63.0",
     "screenshot-desktop": "^1.15.4"
   }
 }
