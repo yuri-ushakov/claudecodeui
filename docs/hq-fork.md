@@ -305,13 +305,19 @@ read-only, без «Сохранить»; markdown открыт отрендер
 В upstream вкладки плагинов всегда идут в хвост после встроенных, за разделителем. Форк
 читает из манифеста плагина поле `tabOrder` (целое ≥ 0; `validateManifest` и `scanPlugins` в
 `server/modules/plugins/plugin-registry.service.ts`, тип `Plugin.tabOrder: number | null` в
-`src/shared/types.ts`): это число встроенных вкладок, после которых ставится плагин — `0` перед
-«Чатом», `1` сразу после него, число больше длины полосы — после последней встроенной. Список
-строит чистая функция `orderTabs(builtIn, plugins)`
-(`src/modules/project-workspace/utils/workspaceTabOrder.ts`): позиционированные плагины
-встраиваются в ряд встроенных (равные слоты — в порядке сканирования), остальные — в хвост, и
-разделитель рисуется только перед хвостом (`WorkspaceTabs.tsx`). У доски штаба `"tabOrder": 1`.
-Тесты: `workspaceTabOrder.test.ts`, `server/modules/plugins/tests/plugin-registry.test.ts`.
+`src/shared/types.ts`): это **номер места в полосе** — `0` первая вкладка (перед «Чатом»), `1`
+вторая (сразу после него), и т. д.; встроенные вкладки занимают места, которые плагины не взяли,
+в своём порядке; число больше длины полосы — после последней встроенной. Список строит чистая
+функция `orderTabs(builtIn, plugins)` (`src/modules/project-workspace/utils/workspaceTabOrder.ts`):
+позиционированные плагины берутся по возрастанию `tabOrder` (равные — в порядке сканирования),
+каждый встаёт на своё место или на ближайшее свободное, если его занял плагин раньше; остальные —
+в хвост, и разделитель рисуется только перед хвостом (`WorkspaceTabs.tsx`). У доски штаба
+`"tabOrder": 1`, у «Отчётов» `2`, у «Расписаний» `3`.
+
+Порядок встроенных вкладок в форке — **Чат, Файлы, Shell, Git** (в upstream Файлы шли после Shell;
+`BASE_TABS` в `WorkspaceTabs.tsx`), поэтому полоса штаба читается Чат, Доска, Отчёты, Расписания,
+Файлы, Shell, Git, Browser, Tasks. Тесты: `workspaceTabOrder.test.ts` (в том числе набор штаба
+целиком), `server/modules/plugins/tests/plugin-registry.test.ts`.
 
 ## Как обновляться
 

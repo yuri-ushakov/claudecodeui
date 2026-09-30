@@ -100,9 +100,10 @@ export function validateManifest(manifest) {
 }
 
 /**
- * Whether a manifest's `tabOrder` names a slot in the workspace tab bar: a
- * non-negative integer (`0` = before the first built-in tab, `1` = right after
- * it, and so on). Plugins without one keep their place at the end of the bar.
+ * Whether a manifest's `tabOrder` names a place in the workspace tab bar: a
+ * non-negative integer — the index the tab wants in the row (`0` = first,
+ * `1` = second, right after Chat, and so on). Plugins without one keep their
+ * place at the end of the bar.
  */
 function isValidTabOrder(value) {
   return typeof value === 'number' && Number.isInteger(value) && value >= 0;

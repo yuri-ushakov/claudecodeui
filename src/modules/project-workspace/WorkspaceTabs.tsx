@@ -32,10 +32,13 @@ type PluginTab = {
 
 type TabDefinition = BuiltInTab | PluginTab;
 
+// Built-in order: Chat, Files, Shell, Git. Files comes right after Chat so
+// that, with the hq plugins at indexes 1–3 (Board, Reports, Schedules), the
+// row reads Chat, Board, Reports, Schedules, Files, Shell, Git, …
 const BASE_TABS: BuiltInTab[] = [
   { kind: 'builtin', id: 'chat',  labelKey: 'tabs.chat',  icon: MessageSquare },
-  { kind: 'builtin', id: 'shell', labelKey: 'tabs.shell', icon: Terminal },
   { kind: 'builtin', id: 'files', labelKey: 'tabs.files', icon: Folder },
+  { kind: 'builtin', id: 'shell', labelKey: 'tabs.shell', icon: Terminal },
   { kind: 'builtin', id: 'git',   labelKey: 'tabs.git',   icon: GitBranch },
 ];
 
@@ -83,8 +86,8 @@ export default function WorkspaceTabs({
       tabOrder: p.tabOrder ?? null,
     }));
 
-  // A plugin may ask for a slot among the built-in tabs (`tabOrder` in its
-  // manifest); the rest trail behind a separator, as they always did.
+  // A plugin may ask for an index in the row (`tabOrder` in its manifest);
+  // the rest trail behind a separator, as they always did.
   const { tabs, separatorIndex } = orderTabs<TabDefinition, TabDefinition>(builtInTabs, pluginTabs);
 
   const handleTabKeyDown = (event: KeyboardEvent<HTMLButtonElement>) => {
