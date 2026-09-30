@@ -916,6 +916,9 @@ async function queryClaudeSDK(command, options = {}, ws, context) {
   // Whether this conversation keeps one process across its turns instead of
   // starting a fresh one per message.
   const keepSessionAlive = Boolean(options.toolsSettings?.keepSessionAlive);
+  // An edited message rewinds the conversation, and a rewind is a startup
+  // option (`resume` + `resumeSessionAt`): only a fresh process can do it.
+  const rewindsConversation = Boolean(options.resumeAnchorId || options.resumeFromScratch);
 
   // A new turn supersedes any earlier one still holding this session's process
   // open, so held runs cannot stack up across a conversation. A process being
@@ -924,6 +927,30 @@ async function queryClaudeSDK(command, options = {}, ws, context) {
   if (sessionKey() && !(keepSessionAlive && getHeldSession(sessionKey()))) {
     getSession(sessionKey())?.releaseInput?.();
   }
+
+  // Hoisted above the try so the catch's cleanup can tell whether this run
+  // still owns the activeSessions entry (or was superseded by a newer run).
+  let queryInstance = null;
+  // The process serving this conversation, when it is being kept alive.
+  let heldSession = null;
+  // Whether this turn already claimed that process (see `reserve`).
+  let heldTurnReserved = false;
+
+  // Whether the process behind this turn outlives the turn: a held process
+  // keeps its activeSessions entry and its background-work bookkeeping until
+  // it actually ends (see `endHeldProcess`), not until the turn does.
+  const processStillHeld = () => Boolean(heldSession && !heldSession.closed);
+
+  // Closes the process this turn runs on: the held one for the whole
+  // conversation, or this turn's own stdin stream. Registered as the
+  // session's `releaseInput`, which abort and superseding turns call.
+  const closeProcess = () => {
+    if (heldSession) {
+      heldSession.close();
+    } else {
+      releasePromptStream();
+    }
+  };
 
   // Arms (or re-arms) the idle countdown that eventually closes stdin.
   const scheduleRelease = () => {
@@ -939,13 +966,16 @@ async function queryClaudeSDK(command, options = {}, ws, context) {
     idleReleaseTimer.unref?.();
   };
 
-  // Hoisted above the try so the catch's cleanup can tell whether this run
-  // still owns the activeSessions entry (or was superseded by a newer run).
-  let queryInstance = null;
-  // The process serving this conversation, when it is being kept alive.
-  let heldSession = null;
-  // Whether this turn already claimed that process (see `reserve`).
-  let heldTurnReserved = false;
+  // The held process has ended, whichever way: drop the bookkeeping that
+  // described it, unless a newer process has already taken the key over.
+  const endHeldProcess = (session, error) => {
+    if (error) {
+      console.error(`[Claude SDK] Held process for session ${session.sessionKey} ended with an error:`, error?.message || error);
+    }
+    if (getSession(session.sessionKey)?.instance === session.instance) {
+      removeSession(session.sessionKey);
+    }
+  };
 
   try {
     const resolvedModel = await context.resolveResumeModel(sessionId, options.model);
@@ -972,6 +1002,67 @@ async function queryClaudeSDK(command, options = {}, ws, context) {
     // `result`. The message list is reusable, but each query attempt needs its
     // own stream because an async generator cannot be replayed once consumed.
     const promptMessages = await buildPromptMessages(command, options.images, options.files, options.cwd);
+
+    // What the CLI fixes when it starts. A held process may serve the next turn
+    // only if all of it still matches; model and permission mode are the
+    // exception and are set on the live process below.
+    const fingerprint = {
+      cwd: options.cwd || '',
+      // The whole configuration, not just the names: a server that keeps its
+      // name but changes command, url, arguments or environment is a different
+      // server, and the running process still has the old one.
+      mcp: stableJson(mcpServers || {}),
+      // The policy the user set, not the list handed to the CLI: plan mode
+      // adds its own read-only tools, and the mode is switched on the live
+      // process. Comparing the full list would start a new process for every
+      // step into a plan and back out of it - `applyTurn` moves those entries
+      // over instead.
+      tools: stableJson({
+        allowed: options.toolsSettings?.allowedTools || [],
+        disallowed: options.toolsSettings?.disallowedTools || [],
+      }),
+      effort: sdkOptions.effort || '',
+      model: sdkOptions.model || '',
+      permissionMode: sdkOptions.permissionMode || 'default',
+      writer: ws,
+    };
+
+    const reusable = keepSessionAlive && !rewindsConversation ? getHeldSession(sessionKey()) : null;
+    if (reusable && reusable.matches(fingerprint)) {
+      // Claimed before anything is applied. `applyTurn` sets the model and the
+      // permission mode on the live process and writes the tool list into the
+      // options the running turn reads from, so a turn that did all that and
+      // only then found the session busy would leave its settings on someone
+      // else's turn. Refusing here also keeps the process: falling through to
+      // the branch below would start a second one and `holdSession` would
+      // close this one, ending the turn it is serving.
+      if (!reusable.reserve()) {
+        throw new Error('This session is already serving a turn.');
+      }
+
+      heldSession = reusable;
+      heldTurnReserved = true;
+      queryInstance = reusable.instance;
+      try {
+        await reusable.applyTurn({
+          model: sdkOptions.model,
+          permissionMode: sdkOptions.permissionMode,
+          allowedTools: sdkOptions.allowedTools,
+        });
+      } catch (error) {
+        // The turn never starts, so the claim has to go back or the process
+        // stays blocked for the rest of the conversation.
+        reusable.cancelReservation();
+        heldTurnReserved = false;
+        throw error;
+      }
+    } else if (keepSessionAlive && sessionKey()) {
+      heldSession = new HeldClaudeSession({
+        sessionKey: sessionKey(),
+        fingerprint,
+        onEnd: endHeldProcess,
+      });
+    }
 
     sdkOptions.hooks = {
       Notification: [{
@@ -1085,64 +1176,7 @@ async function queryClaudeSDK(command, options = {}, ws, context) {
     // stream to drive the hold logic below without a CLI process).
     const createQuery = context.createQuery ?? query;
 
-    // What the CLI fixes when it starts. A held process may serve the next turn
-    // only if all of it still matches; model and permission mode are the
-    // exception and are set on the live process below.
-    const fingerprint = {
-      cwd: options.cwd || '',
-      // The whole configuration, not just the names: a server that keeps its
-      // name but changes command, url, arguments or environment is a different
-      // server, and the running process still has the old one.
-      mcp: stableJson(mcpServers || {}),
-      // The policy the user set, not the list handed to the CLI: plan mode
-      // adds its own read-only tools, and the mode is switched on the live
-      // process. Comparing the full list would start a new process for every
-      // step into a plan and back out of it - `applyTurn` moves those entries
-      // over instead.
-      tools: stableJson({
-        allowed: options.toolsSettings?.allowedTools || [],
-        disallowed: options.toolsSettings?.disallowedTools || [],
-      }),
-      effort: sdkOptions.effort || '',
-      model: sdkOptions.model || '',
-      permissionMode: sdkOptions.permissionMode || 'default',
-      writer: ws,
-    };
-
-    const reusable = keepSessionAlive ? getHeldSession(sessionKey()) : null;
-    if (reusable && reusable.matches(fingerprint)) {
-      // Claimed before anything is applied. `applyTurn` sets the model and the
-      // permission mode on the live process and writes the tool list into the
-      // options the running turn reads from, so a turn that did all that and
-      // only then found the session busy would leave its settings on someone
-      // else's turn. Refusing here also keeps the process: falling through to
-      // the branch below would start a second one and `holdSession` would
-      // close this one, ending the turn it is serving.
-      if (!reusable.reserve()) {
-        throw new Error('This session is already serving a turn.');
-      }
-
-      heldSession = reusable;
-      heldTurnReserved = true;
-      queryInstance = reusable.instance;
-      try {
-        await reusable.applyTurn({
-          model: sdkOptions.model,
-          permissionMode: sdkOptions.permissionMode,
-          allowedTools: sdkOptions.allowedTools,
-        });
-      } catch (error) {
-        // The turn never starts, so the claim has to go back or the process
-        // stays blocked for the rest of the conversation.
-        reusable.cancelReservation();
-        heldTurnReserved = false;
-        throw error;
-      }
-    } else {
-      if (keepSessionAlive && sessionKey()) {
-        heldSession = new HeldClaudeSession({ sessionKey: sessionKey(), fingerprint });
-      }
-
+    if (!heldTurnReserved) {
       // A held session feeds the process itself, turn by turn; a one-shot run
       // gets this turn's messages and nothing more.
       let heldPrompt = heldSession
@@ -1180,12 +1214,7 @@ async function queryClaudeSDK(command, options = {}, ws, context) {
 
     // Track the query instance for abort capability
     if (sessionKey()) {
-      addSession(
-        sessionKey(),
-        queryInstance,
-        ws,
-        heldSession ? () => heldSession.close() : releasePromptStream,
-      );
+      addSession(sessionKey(), queryInstance, ws, closeProcess);
     }
 
     // Process streaming messages
@@ -1197,7 +1226,7 @@ async function queryClaudeSDK(command, options = {}, ws, context) {
       if (message.session_id && !capturedSessionId) {
 
         capturedSessionId = message.session_id;
-        addSession(sessionKey(), queryInstance, ws, releasePromptStream);
+        addSession(sessionKey(), queryInstance, ws, closeProcess);
 
         // Set session ID on writer
         if (ws.setSessionId && typeof ws.setSessionId === 'function') {
@@ -1328,8 +1357,14 @@ async function queryClaudeSDK(command, options = {}, ws, context) {
 
     if (heldSession) {
       // The session reads the stream for all of its turns; this one gets its
-      // messages through the callback and ends with its own `result`.
-      await heldSession.runTurn({ promptMessages, onMessage: handleTurnMessage, reserved: heldTurnReserved });
+      // messages through the callback and ends with its own `result`. The
+      // handler stays attached afterwards for whatever the process pushes
+      // between turns.
+      await heldSession.runTurn({
+        promptMessages,
+        onMessage: handleTurnMessage,
+        reserved: heldTurnReserved,
+      });
     } else {
       for await (const message of queryInstance) {
         handleTurnMessage(message);
@@ -1338,8 +1373,8 @@ async function queryClaudeSDK(command, options = {}, ws, context) {
 
     // Clean up session on completion — only while this run still owns the map
     // entry. A superseding run may have replaced it, and deleting here would
-    // strand that run.
-    if (sessionKey() && getSession(sessionKey())?.instance === queryInstance) {
+    // strand that run. A held process keeps its entry: it is still up.
+    if (sessionKey() && getSession(sessionKey())?.instance === queryInstance && !processStillHeld()) {
       removeSession(sessionKey());
     }
 
@@ -1370,8 +1405,9 @@ async function queryClaudeSDK(command, options = {}, ws, context) {
     console.error('SDK query error:', error);
 
     // Clean up session on error — only while this run still owns the map entry
-    // (a superseding run may have replaced it).
-    if (sessionKey() && getSession(sessionKey())?.instance === queryInstance) {
+    // (a superseding run may have replaced it) and the process is not a held
+    // one that is still up.
+    if (sessionKey() && getSession(sessionKey())?.instance === queryInstance && !processStillHeld()) {
       removeSession(sessionKey());
     }
 
@@ -1410,7 +1446,9 @@ async function queryClaudeSDK(command, options = {}, ws, context) {
     });
   } finally {
     // Always close stdin — otherwise an aborted or failed run leaves the CLI
-    // process (and its MCP servers) alive until the server exits.
+    // process (and its MCP servers) alive until the server exits. A held
+    // process is not touched here: its own idle timer, an abort, or a turn
+    // that needs a different process ends it.
     if (idleReleaseTimer) {
       clearTimeout(idleReleaseTimer);
       idleReleaseTimer = null;

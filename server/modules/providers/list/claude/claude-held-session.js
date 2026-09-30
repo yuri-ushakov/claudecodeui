@@ -5,7 +5,8 @@
  * rebuilds the session from disk through `resume`. That is robust - each turn
  * begins in a clean process, and a server restart costs nothing because the
  * state lives in the session file - but it pays the startup and the rebuild
- * again for every message.
+ * again for every message, and it kills whatever the previous process still
+ * had running in the background (agents, monitors, scheduled wake-ups).
  *
  * With this, the process from the first turn stays and the next message is
  * pushed into the same stdin stream. The SDK supports it: `query()` takes an
@@ -17,10 +18,15 @@
  * arriving on a different writer (a reconnect, another window) simply gets its
  * own process: the writer is part of what `matches()` compares.
  *
+ * The process also outlives the turn's handler in the other direction: what
+ * the CLI pushes between turns - a background agent reporting in, a task
+ * notification - goes to the handler of the turn served last, exactly as the
+ * one-shot hold in the runtime keeps reading after a turn's `result`.
+ *
  * What cannot change is what the CLI fixed at startup: the working directory,
- * the MCP servers, the setting sources. A turn that needs different ones gets
- * a new process; `matches()` decides that. Model and permission mode do change
- * live, through the SDK's own `setModel` / `setPermissionMode`.
+ * the MCP servers, the tool policy, the effort. A turn that needs different
+ * ones gets a new process; `matches()` decides that. Model and permission mode
+ * do change live, through the SDK's own `setModel` / `setPermissionMode`.
  */
 
 /**
@@ -47,11 +53,18 @@ export class HeldClaudeSession {
    * @param {string} args.sessionKey - Key this session is registered under
    * @param {Object} args.fingerprint - What the process was started with
    * @param {number} [args.idleMs] - Idle time before the process is released
+   * @param {(session: HeldClaudeSession, error: Error|null) => void} [args.onEnd] - Called once the process has ended
    */
-  constructor({ sessionKey, fingerprint, idleMs = DEFAULT_IDLE_MS }) {
+  constructor({
+    sessionKey,
+    fingerprint,
+    idleMs = DEFAULT_IDLE_MS,
+    onEnd = () => {},
+  }) {
     this.sessionKey = sessionKey;
     this.fingerprint = fingerprint;
     this.idleMs = idleMs;
+    this.onEnd = onEnd;
 
     /** The SDK query, once started. */
     this.instance = null;
@@ -61,7 +74,12 @@ export class HeldClaudeSession {
     this.appliedAllowedTools = [];
     /** Closes stdin so the CLI can exit. */
     this.release = () => {};
-    /** The turn being served right now, or null between turns. */
+    /**
+     * The turn being served, or the last one served. It stays attached after
+     * its `result` so that what the process pushes between turns - a
+     * background agent reporting in - is handled and shown, exactly as it is
+     * when a one-shot process is held open for that work.
+     */
     this.turn = null;
     /** Messages waiting to go into stdin. */
     this.queue = [];
@@ -72,6 +90,8 @@ export class HeldClaudeSession {
     /** Set while a turn is being served, so a second one cannot cut in. */
     this.busy = false;
   }
+
+  // ---------------------------------------------------------------- turns
 
   /**
    * Claims the process for one turn, or refuses because it is taken.
@@ -166,108 +186,11 @@ export class HeldClaudeSession {
   }
 
   /**
-   * The prompt stream handed to `query()`.
-   *
-   * It never ends on its own: when the queue runs dry it waits, which keeps
-   * stdin open and the process alive until `close()`.
-   */
-  async* promptStream() {
-    while (!this.closed) {
-      while (this.queue.length > 0) {
-        yield this.queue.shift();
-      }
-
-      if (this.closed) {
-        return;
-      }
-
-      await new Promise((resolve) => {
-        this.wake = resolve;
-      });
-      this.wake = null;
-    }
-  }
-
-  /** Queues messages for the CLI and wakes the stream if it is waiting. */
-  push(messages) {
-    for (const message of messages) {
-      this.queue.push(message);
-    }
-    this.wake?.();
-  }
-
-  /**
-   * Whether this process was started with what the next turn needs.
-   *
-   * Only what the CLI fixes at startup is compared. Model, effort and
-   * permission mode are deliberately absent: the first two are handled by the
-   * caller (an effort change forces a restart, the SDK has no live setter),
-   * the third is set live.
-   */
-  matches(fingerprint) {
-    return !this.closed
-      && this.instance !== null
-      && this.fingerprint.cwd === fingerprint.cwd
-      && this.fingerprint.mcp === fingerprint.mcp
-      && this.fingerprint.effort === fingerprint.effort
-      // The tool policy decides what `canUseTool` lets through, and that
-      // callback was built around the first turn's options. Rather than run a
-      // turn under a policy that is no longer the user's, a changed one gets
-      // its own process.
-      && this.fingerprint.tools === fingerprint.tools
-      // The permission callback and the hooks were built around the writer of
-      // the first turn. A reconnect brings a new one, and rather than reaching
-      // through the old socket, that turn gets its own process.
-      && this.fingerprint.writer === fingerprint.writer;
-  }
-
-  /**
-   * Attaches the started query and begins consuming it.
-   *
-   * The options object comes along because the callbacks built into it read
-   * from it at call time; keeping the reference is what lets a later turn
-   * correct what they see.
-   *
-   * @param {Object} instance - The started SDK query
-   * @param {() => void} release - Closes stdin so the CLI can exit
-   * @param {Record<string, unknown>|null} [sdkOptions] - The options it was started with
-   */
-  start(instance, release, sdkOptions = null) {
-    this.instance = instance;
-    this.release = release;
-    this.sdkOptions = sdkOptions;
-    /** What the last turn put there; anything beyond it was remembered live. */
-    this.appliedAllowedTools = [...(sdkOptions?.allowedTools || [])];
-    this.consume();
-  }
-
-  /**
-   * Reads the query for as long as it lives, handing every message to the turn
-   * that is currently being served.
-   *
-   * The loop outlives the individual turn - that is the whole point - so a
-   * message arriving between turns (background work reporting in) has no one to
-   * go to and is dropped rather than sent to a stale socket.
-   */
-  async consume() {
-    try {
-      for await (const message of this.instance) {
-        this.turn?.onMessage(message);
-      }
-    } catch (error) {
-      this.turn?.onError(error);
-    } finally {
-      this.closed = true;
-      heldSessions.delete(this.sessionKey);
-      this.turn?.onError(new Error('The held Claude process ended.'));
-      this.turn = null;
-    }
-  }
-
-  /**
    * Runs one turn on this process.
    *
-   * Resolves when the turn's `result` arrives; the process stays.
+   * Resolves when the turn's `result` arrives; the process stays, and so does
+   * the turn's handler, which keeps receiving whatever the process pushes
+   * until the next turn takes over.
    *
    * @param {Object} args
    * @param {Array<Object>} args.promptMessages - What the user sent
@@ -296,7 +219,6 @@ export class HeldClaudeSession {
         }
         settled = true;
         this.busy = false;
-        this.turn = null;
         this.scheduleIdle();
         if (error) {
           reject(error);
@@ -319,6 +241,118 @@ export class HeldClaudeSession {
     });
   }
 
+  /**
+   * Whether this process was started with what the next turn needs.
+   *
+   * Only what the CLI fixes at startup is compared. Model and permission mode
+   * are deliberately absent: they are set live by `applyTurn`.
+   *
+   * @param {Object} fingerprint - What the next turn would start a process with
+   * @returns {boolean}
+   */
+  matches(fingerprint) {
+    return !this.closed
+      && this.instance !== null
+      && this.fingerprint.cwd === fingerprint.cwd
+      && this.fingerprint.mcp === fingerprint.mcp
+      // Effort has no live setter on the SDK.
+      && this.fingerprint.effort === fingerprint.effort
+      // The tool policy decides what `canUseTool` lets through, and that
+      // callback was built around the first turn's options. Rather than run a
+      // turn under a policy that is no longer the user's, a changed one gets
+      // its own process.
+      && this.fingerprint.tools === fingerprint.tools
+      // The permission callback and the hooks were built around the writer of
+      // the first turn. A reconnect brings a new one, and rather than reaching
+      // through the old socket, that turn gets its own process.
+      && this.fingerprint.writer === fingerprint.writer;
+  }
+
+  // ------------------------------------------------------ process lifetime
+
+  /**
+   * The prompt stream handed to `query()`.
+   *
+   * It never ends on its own: when the queue runs dry it waits, which keeps
+   * stdin open and the process alive until `close()`.
+   */
+  async* promptStream() {
+    while (!this.closed) {
+      while (this.queue.length > 0) {
+        yield this.queue.shift();
+      }
+
+      if (this.closed) {
+        return;
+      }
+
+      await new Promise((resolve) => {
+        this.wake = resolve;
+      });
+      this.wake = null;
+    }
+  }
+
+  /**
+   * Queues messages for the CLI and wakes the stream if it is waiting.
+   * @param {Array<Object>} messages - SDKUserMessage records
+   */
+  push(messages) {
+    for (const message of messages) {
+      this.queue.push(message);
+    }
+    this.wake?.();
+  }
+
+  /**
+   * Attaches the started query and begins consuming it.
+   *
+   * The options object comes along because the callbacks built into it read
+   * from it at call time; keeping the reference is what lets a later turn
+   * correct what they see.
+   *
+   * @param {Object} instance - The started SDK query
+   * @param {() => void} release - Closes stdin so the CLI can exit
+   * @param {Record<string, unknown>|null} [sdkOptions] - The options it was started with
+   */
+  start(instance, release, sdkOptions = null) {
+    this.instance = instance;
+    this.release = release;
+    this.sdkOptions = sdkOptions;
+    /** What the last turn put there; anything beyond it was remembered live. */
+    this.appliedAllowedTools = [...(sdkOptions?.allowedTools || [])];
+    this.consume();
+  }
+
+  /**
+   * Reads the query for as long as it lives, handing every message to the
+   * latest turn.
+   *
+   * The loop outlives the individual turn - that is the whole point - and so
+   * does the turn's handler: a message arriving between turns (background work
+   * reporting in, a task notification) reaches the handler of the turn served
+   * last, which shows it and keeps the background-work bookkeeping current.
+   */
+  async consume() {
+    let failure = null;
+    try {
+      for await (const message of this.instance) {
+        this.turn?.onMessage(message);
+      }
+    } catch (error) {
+      failure = error;
+      this.turn?.onError(error);
+    } finally {
+      this.closed = true;
+      this.clearIdle();
+      heldSessions.delete(this.sessionKey);
+      this.turn?.onError(new Error('The held Claude process ended.'));
+      this.turn = null;
+      this.onEnd(this, failure);
+    }
+  }
+
+  /** Cancels the pending release, if any. */
   clearIdle() {
     if (this.idleTimer) {
       clearTimeout(this.idleTimer);
@@ -329,6 +363,9 @@ export class HeldClaudeSession {
   /** Lets the process go once the conversation has gone quiet. */
   scheduleIdle() {
     this.clearIdle();
+    if (this.closed) {
+      return;
+    }
     this.idleTimer = setTimeout(() => {
       this.idleTimer = null;
       this.close();
@@ -337,6 +374,7 @@ export class HeldClaudeSession {
     this.idleTimer.unref?.();
   }
 
+  /** Ends the prompt stream, which closes stdin and lets the CLI exit. */
   close() {
     if (this.closed) {
       return;
