@@ -334,6 +334,30 @@ export function hasHydratedUserPreferences(): boolean {
   return hasHydrated;
 }
 
+let refreshInFlight: Promise<void> | null = null;
+
+/**
+ * Re-reads the server's copy on a page that already hydrated once.
+ *
+ * The server is the source of truth, and it can change while this page is
+ * not looking - a setting flipped on another device, a permission
+ * remembered in another tab. Called when the page comes back (the tab
+ * becomes visible, the websocket reconnects) so that what the page shows and
+ * sends is not the state it had when it was last in front of the user.
+ * A refresh already in flight is shared rather than repeated.
+ */
+export function refreshUserPreferences(): Promise<void> {
+  if (!hasHydrated) {
+    return Promise.resolve();
+  }
+  if (refreshInFlight === null) {
+    refreshInFlight = hydrateUserPreferences().finally(() => {
+      refreshInFlight = null;
+    });
+  }
+  return refreshInFlight;
+}
+
 /**
  * Drops the in-memory and mirrored copies on sign-out, so the next user on
  * this device does not start out looking at the previous user's settings.

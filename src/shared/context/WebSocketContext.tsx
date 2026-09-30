@@ -4,6 +4,7 @@ import { useAuth } from '@/modules/auth';
 import { IS_PLATFORM } from '@/shared/utils';
 import { expireAuthSession, isAuthTokenExpired } from '@/shared/authToken';
 import type { ServerEvent } from '@/shared/types';
+import { refreshUserPreferences } from '@/shared/userSettings';
 
 
 type ServerEventListener = (event: ServerEvent) => void;
@@ -89,6 +90,9 @@ const useWebSocketProviderState = (): WebSocketContextType => {
         if (hasConnectedRef.current) {
           // This is a reconnect — signal so components can catch up on missed messages
           dispatch({ kind: 'websocket_reconnected', timestamp: Date.now() });
+          // And on settings that may have changed on another device meanwhile:
+          // the server's copy is what the next message must be sent under.
+          void refreshUserPreferences();
         }
         hasConnectedRef.current = true;
       };

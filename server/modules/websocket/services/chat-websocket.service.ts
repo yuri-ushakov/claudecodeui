@@ -3,7 +3,7 @@ import path from 'node:path';
 import type { WebSocket } from 'ws';
 
 import { sessionsDb } from '@/modules/database/index.js';
-import { providerModelsService, sessionsService } from '@/modules/providers/index.js';
+import { providerModelsService, sessionsService, toolPolicyService } from '@/modules/providers/index.js';
 import { chatRunRegistry } from '@/modules/websocket/services/chat-run-registry.service.js';
 import { connectedClients, WS_OPEN_STATE } from '@/modules/websocket/services/websocket-state.service.js';
 import {
@@ -269,6 +269,15 @@ async function dispatchRun(
   // Brand-new sessions have no provider id yet, so the runtime starts fresh
   // and announces one, which the gateway writer captures and maps back to the
   // app session id.
+  // The tool policy is the user's stored one, not the sending device's copy:
+  // a page that has not caught up with a settings change on another device
+  // would otherwise run this turn under a different policy than the last.
+  const toolPolicy = toolPolicyService.resolve({
+    provider,
+    userId,
+    clientToolsSettings: clientOptions.toolsSettings,
+  });
+
   const runtimeOptions: AnyRecord = {
     ...clientOptions,
     ...extraRuntimeOptions,
@@ -280,6 +289,10 @@ async function dispatchRun(
     sessionId,
     cwd: clientOptions.cwd ?? session.project_path ?? undefined,
     projectPath: session.project_path ?? clientOptions.projectPath,
+    toolsSettings: toolPolicy.toolsSettings,
+    toolsSettingsSource: toolPolicy.source,
+    // The client derives this flag from the same settings; keep it in step.
+    skipPermissions: Boolean(toolPolicy.toolsSettings?.skipPermissions),
   };
 
   let failure: string | null = null;

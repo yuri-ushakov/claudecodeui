@@ -60,11 +60,19 @@ export function getClaudeSettings(): ClaudeSettings {
   };
 }
 
-/** Persists Claude's tool permissions after the user grants one from the chat. */
+/**
+ * Persists Claude's tool permissions after the user grants one from the chat.
+ *
+ * Written over the stored object rather than in place of it: the same
+ * preference also carries settings this code does not manage (whether one
+ * process is kept for the whole conversation), and a page that overwrote the
+ * whole object from its own copy would reset those for every device.
+ */
 export function saveClaudePermissions(permissions: {
   allowedTools: string[];
   disallowedTools: string[];
   skipPermissions: boolean;
 }): void {
-  writeUserPreference('claudePermissions', permissions);
+  const stored = readUserPreference<Record<string, unknown>>('claudePermissions', {});
+  writeUserPreference('claudePermissions', { ...stored, ...permissions });
 }
