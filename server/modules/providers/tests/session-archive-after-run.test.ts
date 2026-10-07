@@ -5,6 +5,7 @@ import path from 'node:path';
 import test from 'node:test';
 
 import { closeConnection, initializeDatabase, sessionsDb } from '@/modules/database/index.js';
+import { connectedClients } from '@/modules/websocket/index.js';
 
 /**
  * A run's caller archives its session right after the response. The sessions
@@ -148,5 +149,26 @@ test('archiveSessionAfterRun refuses an unknown session with 404', async () => {
       () => sessionsService.archiveSessionAfterRun('nope'),
       (error: { statusCode?: number }) => error.statusCode === 404,
     );
+  });
+});
+
+test('archiveSessionAfterRun tells open sidebars the session is archived (scheduled runs)', async () => {
+  await withIsolatedDatabase(async () => {
+    await createRunSession('app-live', 'native-live', { indexed: true });
+    const frames: Array<Record<string, unknown>> = [];
+    const connection = { readyState: 1, send: (data: string) => frames.push(JSON.parse(data)) };
+    connectedClients.add(connection as never);
+
+    try {
+      await sessionsService.archiveSessionAfterRun('app-live');
+    } finally {
+      connectedClients.delete(connection as never);
+    }
+
+    const archived = frames.filter((frame) => frame.kind === 'session_archived');
+    assert.equal(archived.length, 1);
+    assert.equal(archived[0].sessionId, 'app-live');
+    assert.equal(archived[0].providerSessionId, 'native-live');
+    assert.equal(archived[0].action, 'archived');
   });
 });

@@ -175,9 +175,7 @@ i18n `permissions.keepSessionAlive`).
     Опрос того же файла после этого ничего нового не находит; настоящая новая активность в
     сессии по-прежнему возвращает её из архива.
 
-    Открытая вкладка живого события «сессия ушла в архив» не получает (такого события в
-    CloudCLI нет — панель, архивируя сама, правит свой список локально): заархивированная
-    сессия исчезает из панели при ближайшем перечитывании списка проектов.
+    Открытые вкладки узнают об архивации живым событием `session_archived` (правка 12).
 
     Тесты: `server/modules/agent/tests/agent.routes.test.ts` (ключ обязателен вне платформы,
     ответ, ошибка сервиса → 500), `agent-run-registration.test.ts` (прогон → архив по app id и
@@ -185,6 +183,40 @@ i18n `permissions.keepSessionAlive`).
     `server/modules/providers/tests/session-archive-after-run.test.ts` (гонка: простая
     архивация снимается опросом, `archiveSessionAfterRun` — нет; строка без `jsonl_path`;
     новая активность возвращает из архива; 404).
+
+12. **Живые события «сессия ушла в архив / вернулась»: `session_archived`, `session_restored`.**
+    Панель обновлялась только дельтами `session_upserted`, а их строитель архивные строки
+    пропускает. Своя архивация вкладки правила список локально, но сессия, заархивированная
+    маршрутом из правки 11 (плановые прогоны) или в другой вкладке, висела в панели до
+    перезагрузки страницы. Теперь `sessionsService.deleteOrArchiveSessionById` после записи шлёт
+    всем сокетам `session_archived` (`sessionId`, `providerSessionId`, `provider`, `project`,
+    `timestamp`, `action: "archived" | "deleted"` — и для архивации, и для `force`-удаления; строится
+    из снимка строки до изменения, потому что после удаления строки нет), а
+    `restoreSessionById` — `session_restored`. Отдельный вид у restore, а не `session_upserted`:
+    upsert клиент понимает как новую активность (точка внимания, перечитывание открытого
+    транскрипта), а восстановление — не активность; полезная нагрузка та же, что у upsert.
+    Сбой рассылки не превращает архивацию в ошибку (только лог). Строители — в том же
+    `session-upsert-broadcast.service.ts`, типы — `server/shared/types.ts` и зеркало
+    `src/shared/types.ts`.
+
+    Клиент: `useProjectsState` на `session_archived` убирает строку из проекта по обоим id
+    (с уменьшением `sessionMeta.total`), снимает точку внимания, а если это открытая сессия —
+    закрывает её и уходит на `/`, как `handleSessionDelete`; на `session_restored` вставляет
+    строку как upsert, без внимания. Списки «Беседы» и «Архив» живут в `useSidebarController` —
+    им передаётся `sessionArchiveChange` (`seq`, id, `archived`) через `sidebarSharedProps`:
+    архивная строка уходит из «Бесед» (счётчик — только за реально убранные), «Архив»
+    перечитывается. Всё идемпотентно со своей локальной архивацией: событие приходит и во
+    вкладку, которая архивировала, в любом порядке относительно ответа на запрос — второе
+    применение ничего не меняет. Восстановленная сессия в «Беседы» сама не возвращается (это
+    постраничная лента с сервера, она подхватит её при следующей загрузке — как и после
+    локального restore). Чат события игнорирует (`useChatRealtimeHandlers`).
+
+    Тесты: `server/modules/providers/tests/session-archive-broadcast.test.ts` (архив, force,
+    restore, 404 без событий), `session-archive-after-run.test.ts` (API-архивация шлёт
+    `session_archived`), `src/modules/project-workspace/tests/projectsStateSessionArchive.test.ts`
+    (фоновая сессия, строка под id провайдера, открытая сессия, локальная архивация + событие
+    в обоих порядках, restore без внимания),
+    `src/modules/sidebar/tests/sessionArchiveChange.test.ts` («Беседы» и «Архив»).
 
 Выключенный тумблер = поведение main без изменений (тест «with the option off…»).
 

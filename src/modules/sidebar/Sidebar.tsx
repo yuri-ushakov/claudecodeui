@@ -8,7 +8,15 @@ import { useSidebarController } from '@/modules/sidebar/hooks/useSidebarControll
 import { useTaskMaster, useTasksSettings } from '@/modules/task-master';
 import { usePaletteOps } from '@/modules/command-palette';
 import { useBackgroundSessionIdSet, useBusySessionIdSet } from '@/shared/context/SessionProtectionContext';
-import type { LLMProvider, LoadingProgress, MCPServerStatus, Project, ProjectSession, SidebarProjectListProps } from '@/shared/types';
+import type {
+  LLMProvider,
+  LoadingProgress,
+  MCPServerStatus,
+  Project,
+  ProjectSession,
+  SidebarProjectListProps,
+  SidebarSessionArchiveChange,
+} from '@/shared/types';
 import SidebarCollapsed from '@/modules/sidebar/SidebarCollapsed';
 import SidebarContent from '@/modules/sidebar/SidebarContent';
 import SidebarModals from '@/modules/sidebar/SidebarModals';
@@ -22,6 +30,8 @@ type SidebarProps = {
   onSessionSelect: (session: ProjectSession) => void;
   onNewSession: (project: Project) => void;
   onSessionDelete?: (sessionId: string) => void;
+  /** Latest archive/restore announced over the websocket (see `useProjectsState`). */
+  sessionArchiveChange?: SidebarSessionArchiveChange | null;
   onLoadMoreSessions?: (projectId: string) => Promise<void> | void;
   // `projectId` is the DB identifier; the sidebar hands it back to the parent
   // when the delete flow completes.
@@ -51,6 +61,7 @@ function Sidebar({
   onSessionSelect,
   onNewSession,
   onSessionDelete,
+  sessionArchiveChange,
   onLoadMoreSessions,
   onProjectDelete,
   isLoading,
@@ -159,6 +170,7 @@ function Sidebar({
     onProjectSelect,
     onSessionSelect,
     onSessionDelete,
+    sessionArchiveChange,
     onLoadMoreSessions,
     onProjectDelete,
     setCurrentProject,

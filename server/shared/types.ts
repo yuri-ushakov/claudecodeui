@@ -205,6 +205,8 @@ export type MessageKind =
 export type GatewayEventKind =
   | 'chat_subscribed'
   | 'session_upserted'
+  | 'session_archived'
+  | 'session_restored'
   | 'loading_progress'
   | 'protocol_error';
 
@@ -251,6 +253,43 @@ export type SessionUpsertedEvent = {
   };
   project: SessionUpsertedProject | null;
   timestamp: string;
+};
+
+/**
+ * The `session_archived` sidebar delta: one session left the active lists.
+ *
+ * Built only by `modules/websocket/services/session-upsert-broadcast.service.ts`
+ * and sent by `sessionsService.deleteOrArchiveSessionById` for every caller —
+ * the sidebar's own delete/archive, the hq fork's API-key archive route
+ * (`POST /api/agent/sessions/:id/archive`), and force-delete. `session_upserted`
+ * cannot carry this: its builder skips archived rows by design, and before this
+ * event a session archived by any path other than the tab that clicked it
+ * stayed in every other open sidebar until a full reload.
+ *
+ * `action` mirrors the service result: `'archived'` (row kept, restorable —
+ * the client also refreshes its archived list) or `'deleted'` (row gone).
+ * Applying the event to a client that already removed the row is a no-op.
+ */
+export type SessionArchivedEvent = {
+  kind: 'session_archived';
+  sessionId: string;
+  providerSessionId: string | null;
+  provider: LLMProvider;
+  action: 'archived' | 'deleted';
+  project: SessionUpsertedProject | null;
+  timestamp: string;
+};
+
+/**
+ * The `session_restored` sidebar delta: an archived session is back in the
+ * active lists (`sessionsService.restoreSessionById`). Same payload as
+ * `session_upserted` — the row is re-inserted in place exactly like an upsert —
+ * but a separate kind, because an upsert means "new activity" to the client
+ * (attention dot, chat reload of the viewed transcript) and a restore is not
+ * activity. The client also refreshes its archived list on it.
+ */
+export type SessionRestoredEvent = Omit<SessionUpsertedEvent, 'kind'> & {
+  kind: 'session_restored';
 };
 
 /**
