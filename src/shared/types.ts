@@ -242,8 +242,8 @@ export type SessionActivitySnapshot = {
 /**
  * One frame received from the chat websocket. The server guarantees every
  * frame carries a `kind` (provider message kinds plus gateway kinds such as
- * `chat_subscribed`, `session_upserted`, `loading_progress`,
- * `protocol_error`). The synthetic `websocket_reconnected` kind is injected
+ * `chat_subscribed`, `session_upserted`, `session_archived`,
+ * `session_restored`, `loading_progress`, `protocol_error`). The synthetic `websocket_reconnected` kind is injected
  * client-side when the socket re-opens after a drop.
  */
 export type ServerEvent = {
@@ -252,6 +252,41 @@ export type ServerEvent = {
   sessionId?: string;
   seq?: number;
   [key: string]: unknown;
+};
+
+/**
+ * Mirror of the server's `SessionArchivedEvent` (`server/shared/types.ts`):
+ * one session left the active lists — archived (`action: 'archived'`, still
+ * restorable) or force-deleted (`action: 'deleted'`) — by any client or by the
+ * API-key archive route. Handled by `useProjectsState`; applying it to a client
+ * that already removed the row is a no-op.
+ */
+export type SessionArchivedEvent = ServerEvent & {
+  kind: 'session_archived';
+  sessionId: string;
+  providerSessionId?: string | null;
+  provider: LLMProvider;
+  action: 'archived' | 'deleted';
+  project: {
+    projectId: string;
+    path: string;
+    fullPath: string;
+    displayName: string;
+    isStarred: boolean;
+  } | null;
+  timestamp?: string;
+};
+
+/**
+ * What the sidebar needs to hear about a session leaving or re-entering the
+ * active lists through someone else's action (another tab, the API): the ids
+ * the row may be listed under, and a sequence number so the same id archived,
+ * restored and archived again is still seen as a new change.
+ */
+export type SidebarSessionArchiveChange = {
+  seq: number;
+  sessionIds: string[];
+  archived: boolean;
 };
 
 

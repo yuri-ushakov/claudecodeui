@@ -56,8 +56,8 @@ type UseChatRealtimeHandlersArgs = {
  * This is intentionally a thin reducer over the unified `kind`-based
  * protocol: every frame is keyed by the stable app session id, so there is
  * no session-id handoff, no provider branching, and no navigation here.
- * Sidebar events (`session_upserted`, `loading_progress`) are handled by
- * `useProjectsState`, not in this hook.
+ * Sidebar events (`session_upserted`, `session_archived`, `session_restored`,
+ * `loading_progress`) are handled by `useProjectsState`, not in this hook.
  */
 export function useChatRealtimeHandlers({
   isActive,
@@ -194,6 +194,8 @@ export function useChatRealtimeHandlers({
 
         // Sidebar/global events — owned by useProjectsState.
         case 'session_upserted':
+        case 'session_archived':
+        case 'session_restored':
         case 'loading_progress':
           return;
 

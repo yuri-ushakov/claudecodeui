@@ -838,7 +838,7 @@ router.post(
   '/sessions/:sessionId/restore',
   asyncHandler(async (req: Request, res: Response) => {
     const sessionId = parseSessionId(req.params.sessionId);
-    const result = sessionsService.restoreSessionById(sessionId);
+    const result = await sessionsService.restoreSessionById(sessionId);
     res.json(createApiSuccessResponse(result));
   }),
 );

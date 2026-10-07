@@ -4,7 +4,7 @@ import type { TFunction } from 'i18next';
 import { api } from '@/shared/api';
 import { subscribeToUserPreferences } from '@/shared/userSettings';
 import { usePaletteOps } from '@/modules/command-palette';
-import type { ArchivedProjectListItem, ArchivedSessionListItem, ConversationProjectResult, ConversationSearchResults, LLMProvider, Project, ProjectSession, ProjectSortOrder, RecentConversationListItem, SearchProgress, ActiveSidebarRename, PendingSidebarDeletion, SessionTitleSearchResult, SessionWithProvider, SidebarSearchMode, SidebarSessionSelection } from '@/shared/types';
+import type { ArchivedProjectListItem, ArchivedSessionListItem, ConversationProjectResult, ConversationSearchResults, LLMProvider, Project, ProjectSession, ProjectSortOrder, RecentConversationListItem, SearchProgress, ActiveSidebarRename, PendingSidebarDeletion, SessionTitleSearchResult, SessionWithProvider, SidebarSearchMode, SidebarSessionArchiveChange, SidebarSessionSelection } from '@/shared/types';
 import {
   filterProjects,
   getAllSessions,
@@ -54,6 +54,13 @@ type UseSidebarControllerArgs = {
   onProjectSelect: (project: Project) => void;
   onSessionSelect: (session: ProjectSession) => void;
   onSessionDelete?: (sessionId: string) => void;
+  /**
+   * A session archived/deleted or restored by someone else (another tab, the
+   * API-key archive route), as announced by `useProjectsState`. The project
+   * rows are already updated there; this hook owns the Conversations and
+   * Archived lists, so it patches those.
+   */
+  sessionArchiveChange?: SidebarSessionArchiveChange | null;
   onLoadMoreSessions?: (projectId: string) => Promise<void> | void;
   // `projectId` is the DB-assigned identifier; callbacks use that post-migration.
   onProjectDelete?: (projectId: string) => void;
@@ -75,6 +82,7 @@ export function useSidebarController({
   onProjectSelect,
   onSessionSelect,
   onSessionDelete,
+  sessionArchiveChange,
   onLoadMoreSessions,
   onProjectDelete,
   setCurrentProject,
@@ -325,6 +333,35 @@ export function useSidebarController({
   useEffect(() => {
     void fetchArchivedSessions();
   }, [fetchArchivedSessions]);
+
+  // Archive/restore announced over the websocket. Idempotent with the local
+  // archive in `confirmDeleteSession`: whichever runs second finds the row
+  // already gone from Conversations and the total is only moved for rows
+  // actually removed; the Archived list is simply refetched. A restored
+  // session is not put back into Conversations here — that list is a paged
+  // server feed and picks it up on its next load, as after a local restore.
+  const lastSessionArchiveChangeSeqRef = useRef(0);
+  useEffect(() => {
+    if (!sessionArchiveChange || sessionArchiveChange.seq === lastSessionArchiveChangeSeqRef.current) {
+      return;
+    }
+    lastSessionArchiveChangeSeqRef.current = sessionArchiveChange.seq;
+
+    if (sessionArchiveChange.archived) {
+      const removedIds = new Set(sessionArchiveChange.sessionIds);
+      setRecentConversations((previous) => {
+        const remaining = previous.filter((conversation) => !removedIds.has(conversation.sessionId));
+        if (remaining.length === previous.length) {
+          return previous;
+        }
+        const removedCount = previous.length - remaining.length;
+        setRecentConversationsTotal((total) => Math.max(0, total - removedCount));
+        return remaining;
+      });
+    }
+
+    void fetchArchivedSessions();
+  }, [fetchArchivedSessions, sessionArchiveChange]);
 
   useEffect(() => {
     if (searchMode !== 'conversations' || debouncedSearchQuery.length >= 2) {

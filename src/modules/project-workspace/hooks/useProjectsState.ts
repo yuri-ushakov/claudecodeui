@@ -7,7 +7,10 @@ import type { ServerEvent,
   LLMProvider,
   LoadingProgress,
   Project,
-  ProjectSession,IsSessionProcessing } from '@/shared/types';
+  ProjectSession,
+  IsSessionProcessing,
+  SessionArchivedEvent,
+  SidebarSessionArchiveChange } from '@/shared/types';
 import { mergeProjectSelectionMetadata } from '@/modules/project-workspace/utils/projectSelectionMetadata';
 import { readSelectedProvider } from '@/shared/selectedProvider';
 
@@ -224,7 +227,9 @@ const mergeProjectSessionPage = (
   return mergedProject;
 };
 
-const getSessionAliasIds = (event: SessionUpsertedEvent): Set<string> => {
+const getSessionAliasIds = (
+  event: Pick<SessionUpsertedEvent, 'sessionId' | 'providerSessionId'> & { session?: { id?: unknown } },
+): Set<string> => {
   const ids = new Set<string>();
   const add = (value: unknown) => {
     if (typeof value !== 'string') {
@@ -324,9 +329,19 @@ const projectFromRegistration = (project: Project): Project => ({
   taskmaster: project.taskmaster,
 });
 
-const removeSessionFromProject = (project: Project, sessionIdToDelete: string): Project => {
+const removeSessionFromProject = (project: Project, sessionIdToDelete: string): Project =>
+  removeSessionAliasesFromProject(project, new Set([sessionIdToDelete]));
+
+/**
+ * Drops every row listed under any of `sessionIds` (a session can still be
+ * shown under its provider id before the merge into its app row). Returns the
+ * same project when it holds none of them, so a second removal of a row that
+ * is already gone changes nothing — `sessionMeta.total` is decremented only
+ * for rows actually removed.
+ */
+const removeSessionAliasesFromProject = (project: Project, sessionIds: ReadonlySet<string>): Project => {
   const sessions = project.sessions ?? [];
-  const nextSessions = sessions.filter((session) => session.id !== sessionIdToDelete);
+  const nextSessions = sessions.filter((session) => !sessionIds.has(String(session.id)));
   if (nextSessions.length === sessions.length) {
     return project;
   }
@@ -336,7 +351,8 @@ const removeSessionFromProject = (project: Project, sessionIdToDelete: string): 
     sessions: nextSessions,
   };
 
-  const totalSessions = Math.max(0, Number(project.sessionMeta?.total ?? 0) - 1);
+  const removedCount = sessions.length - nextSessions.length;
+  const totalSessions = Math.max(0, Number(project.sessionMeta?.total ?? 0) - removedCount);
   updatedProject.sessionMeta = {
     ...project.sessionMeta,
     total: totalSessions,
@@ -406,6 +422,10 @@ export function useProjectsState({
   const [showSettings, setShowSettings] = useState(false);
   const [settingsInitialTab, setSettingsInitialTab] = useState('agents');
   const [externalMessageUpdate, setExternalMessageUpdate] = useState(0);
+  // Archive/restore of a session announced over the websocket. The sidebar's
+  // own lists (Conversations, Archived) live in its controller, so it gets the
+  // change as a value to react to rather than the raw event.
+  const [sessionArchiveChange, setSessionArchiveChange] = useState<SidebarSessionArchiveChange | null>(null);
   /**
    * `newSessionTrigger` is an explicit, monotonic intent signal for user-driven
    * New Session actions.
@@ -722,77 +742,12 @@ export function useProjectsState({
   // a keyed upsert that can never clobber unrelated client state — no
   // "suppress updates while a run is active" protection is needed anymore.
   useEffect(() => {
-    const handleEvent = (event: ServerEvent) => {
-      // The project list is maintained purely by incremental `session_upserted`
-      // deltas, so anything that happened while the socket was down is missing
-      // from it until something else forces a refresh. Chat re-syncs itself on
-      // this event; the sidebar has to as well.
-      if (event.kind === 'websocket_reconnected') {
-        void refreshProjectsSilently();
-        return;
-      }
-
-      if (event.kind === 'loading_progress') {
-        if (loadingProgressTimeoutRef.current) {
-          clearTimeout(loadingProgressTimeoutRef.current);
-          loadingProgressTimeoutRef.current = null;
-        }
-
-        setLoadingProgress(event as unknown as LoadingProgress);
-
-        if (event.phase === 'complete') {
-          loadingProgressTimeoutRef.current = setTimeout(() => {
-            setLoadingProgress(null);
-            loadingProgressTimeoutRef.current = null;
-          }, 500);
-        }
-
-        return;
-      }
-
-      const eventSessionId = typeof event.sessionId === 'string' && event.sessionId
-        ? event.sessionId
-        : null;
-      const viewedSessionId = selectedSessionRef.current?.id ?? sessionId ?? null;
-
-      if (
-        eventSessionId
-        && eventSessionId !== viewedSessionId
-        && event.kind !== 'chat_subscribed'
-        && event.kind !== 'loading_progress'
-        && event.kind !== 'session_upserted'
-        && event.kind !== 'status'
-        && event.kind !== 'stream_end'
-        && event.kind !== 'permission_resolved'
-        && event.kind !== 'permission_cancelled'
-        && event.kind !== 'websocket_reconnected'
-      ) {
-        markSessionAttention(eventSessionId);
-      }
-
-      if (event.kind !== 'session_upserted') {
-        return;
-      }
-
-      const upsert = event as SessionUpsertedEvent;
-      if (!upsert.sessionId || !upsert.session) {
-        return;
-      }
-
-      // The transcript of the currently viewed session changed on disk while
-      // no run is active here (e.g. edited from another client or the CLI):
-      // signal the chat view to reload its messages.
-      const currentSelectedSession = selectedSessionRef.current;
-      if (
-        currentSelectedSession
-        && upsert.sessionId === currentSelectedSession.id
-        && !isSessionProcessing(upsert.sessionId)
-      ) {
-        setExternalMessageUpdate((prev) => prev + 1);
-      } else {
-        markSessionAttention(upsert.sessionId);
-      }
-
+    /**
+     * Upserts one session row into its project (creating the project entry for
+     * a project this client has never seen) and syncs the selected project's
+     * metadata. Shared by `session_upserted` and `session_restored`.
+     */
+    const applySessionUpsert = (upsert: SessionUpsertedEvent) => {
       setProjects((previousProjects) => {
         const targetProjectId = upsert.project?.projectId;
         const existingProject = previousProjects.find((project) =>
@@ -841,6 +796,142 @@ export function useProjectsState({
         }
         return mergeProjectSelectionMetadata(previousProject, upsert.project);
       });
+    };
+
+    /**
+     * A session left the active lists — archived or force-deleted, by this tab,
+     * another tab, or the API-key archive route. Mirrors `handleSessionDelete`
+     * (the local path) and is idempotent with it: when this tab archived the
+     * row itself, whichever of the two runs second finds nothing to remove.
+     */
+    const handleSessionArchived = (archived: SessionArchivedEvent) => {
+      if (!archived.sessionId) {
+        return;
+      }
+
+      const aliasIds = getSessionAliasIds(archived);
+      aliasIds.forEach((id) => clearSessionAttention(id));
+
+      const viewedSessionId = selectedSessionRef.current?.id ?? sessionId ?? null;
+      if (viewedSessionId && aliasIds.has(viewedSessionId)) {
+        setSelectedSession(null);
+        navigate('/');
+      }
+
+      setProjects((previousProjects) => {
+        let changed = false;
+        const nextProjects = previousProjects.map((project) => {
+          const updated = removeSessionAliasesFromProject(project, aliasIds);
+          if (updated !== project) {
+            changed = true;
+          }
+          return updated;
+        });
+        return changed ? nextProjects : previousProjects;
+      });
+
+      setSessionArchiveChange((previous) => ({
+        seq: (previous?.seq ?? 0) + 1,
+        sessionIds: [...aliasIds],
+        archived: true,
+      }));
+    };
+
+    const handleEvent = (event: ServerEvent) => {
+      // The project list is maintained purely by incremental `session_upserted`
+      // deltas, so anything that happened while the socket was down is missing
+      // from it until something else forces a refresh. Chat re-syncs itself on
+      // this event; the sidebar has to as well.
+      if (event.kind === 'websocket_reconnected') {
+        void refreshProjectsSilently();
+        return;
+      }
+
+      if (event.kind === 'loading_progress') {
+        if (loadingProgressTimeoutRef.current) {
+          clearTimeout(loadingProgressTimeoutRef.current);
+          loadingProgressTimeoutRef.current = null;
+        }
+
+        setLoadingProgress(event as unknown as LoadingProgress);
+
+        if (event.phase === 'complete') {
+          loadingProgressTimeoutRef.current = setTimeout(() => {
+            setLoadingProgress(null);
+            loadingProgressTimeoutRef.current = null;
+          }, 500);
+        }
+
+        return;
+      }
+
+      if (event.kind === 'session_archived') {
+        handleSessionArchived(event as SessionArchivedEvent);
+        return;
+      }
+
+      if (event.kind === 'session_restored') {
+        // Same payload as `session_upserted` under its own kind (see
+        // `SessionRestoredEvent` in `server/shared/types.ts`). Re-inserted
+        // exactly like an upsert, but a restore is not activity: no attention
+        // dot, no reload of the viewed transcript.
+        const restored = event as SessionUpsertedEvent;
+        if (!restored.sessionId || !restored.session) {
+          return;
+        }
+        applySessionUpsert(restored);
+        setSessionArchiveChange((previous) => ({
+          seq: (previous?.seq ?? 0) + 1,
+          sessionIds: [...getSessionAliasIds(restored)],
+          archived: false,
+        }));
+        return;
+      }
+
+      const eventSessionId = typeof event.sessionId === 'string' && event.sessionId
+        ? event.sessionId
+        : null;
+      const viewedSessionId = selectedSessionRef.current?.id ?? sessionId ?? null;
+
+      if (
+        eventSessionId
+        && eventSessionId !== viewedSessionId
+        && event.kind !== 'chat_subscribed'
+        && event.kind !== 'loading_progress'
+        && event.kind !== 'session_upserted'
+        && event.kind !== 'status'
+        && event.kind !== 'stream_end'
+        && event.kind !== 'permission_resolved'
+        && event.kind !== 'permission_cancelled'
+        && event.kind !== 'websocket_reconnected'
+      ) {
+        markSessionAttention(eventSessionId);
+      }
+
+      if (event.kind !== 'session_upserted') {
+        return;
+      }
+
+      const upsert = event as SessionUpsertedEvent;
+      if (!upsert.sessionId || !upsert.session) {
+        return;
+      }
+
+      // The transcript of the currently viewed session changed on disk while
+      // no run is active here (e.g. edited from another client or the CLI):
+      // signal the chat view to reload its messages.
+      const currentSelectedSession = selectedSessionRef.current;
+      if (
+        currentSelectedSession
+        && upsert.sessionId === currentSelectedSession.id
+        && !isSessionProcessing(upsert.sessionId)
+      ) {
+        setExternalMessageUpdate((prev) => prev + 1);
+      } else {
+        markSessionAttention(upsert.sessionId);
+      }
+
+      applySessionUpsert(upsert);
 
       const aliasedSelectedSessionId =
         typeof upsert.providerSessionId === 'string' && upsert.providerSessionId !== upsert.sessionId
@@ -874,7 +965,15 @@ export function useProjectsState({
     };
 
     return subscribe(handleEvent);
-  }, [isSessionProcessing, markSessionAttention, navigate, refreshProjectsSilently, sessionId, subscribe]);
+  }, [
+    clearSessionAttention,
+    isSessionProcessing,
+    markSessionAttention,
+    navigate,
+    refreshProjectsSilently,
+    sessionId,
+    subscribe,
+  ]);
 
   useEffect(() => {
     return () => {
@@ -1258,6 +1357,7 @@ export function useProjectsState({
       onSessionSelect: handleSessionSelect,
       onNewSession: handleNewSession,
       onSessionDelete: handleSessionDelete,
+      sessionArchiveChange,
       onLoadMoreSessions: loadMoreProjectSessions,
       onProjectDelete: handleProjectDelete,
       isLoading: isLoadingProjects,
@@ -1285,6 +1385,7 @@ export function useProjectsState({
       settingsInitialTab,
       selectedProject,
       selectedSession,
+      sessionArchiveChange,
       showSettings,
     ],
   );

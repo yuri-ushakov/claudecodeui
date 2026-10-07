@@ -3,7 +3,12 @@ import fsp from 'node:fs/promises';
 import path from 'node:path';
 
 import { projectsDb, sessionsDb } from '@/modules/database/index.js';
-import { broadcastSessionUpserted, chatRunRegistry } from '@/modules/websocket/index.js';
+import {
+  broadcastSessionArchived,
+  broadcastSessionRestored,
+  broadcastSessionUpserted,
+  chatRunRegistry,
+} from '@/modules/websocket/index.js';
 import { providerRegistry } from '@/modules/providers/provider.registry.js';
 import { listBusyClaudeCliSessions } from '@/modules/providers/services/claude-cli-liveness.service.js';
 import { sessionHistoryCache } from '@/modules/providers/services/session-history-cache.service.js';
@@ -17,6 +22,21 @@ import type {
   WorkflowAgentActivity,
 } from '@/shared/types.js';
 import { AppError, sliceTailPage } from '@/shared/utils.js';
+
+/**
+ * Sends a sidebar delta after an archive/delete/restore has been written.
+ * The database change is the result the caller asked for; a failed websocket
+ * send must not turn it into an error response (the client still converges on
+ * its next full project fetch), so it is only logged.
+ */
+async function announceSidebarChange(broadcast: Promise<void>): Promise<void> {
+  try {
+    await broadcast;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.error('Failed to broadcast a sidebar session change', { error: message });
+  }
+}
 
 /**
  * One session the running-sessions poll reports as busy.
@@ -691,6 +711,7 @@ export const sessionsService = {
 
     if (!options.force) {
       sessionsDb.updateSessionIsArchived(sessionId, true);
+      await announceSidebarChange(broadcastSessionArchived(session, 'archived'));
       return {
         sessionId,
         action: 'archived',
@@ -722,6 +743,8 @@ export const sessionsService = {
         statusCode: 404,
       });
     }
+
+    await announceSidebarChange(broadcastSessionArchived(session, 'deleted'));
 
     return {
       sessionId,
@@ -766,9 +789,10 @@ export const sessionsService = {
   },
 
   /**
-   * Restores one archived session back into the active sidebar lists.
+   * Restores one archived session back into the active sidebar lists and
+   * announces it (`session_restored`) so other open sidebars re-insert the row.
    */
-  restoreSessionById(sessionId: string): { sessionId: string; isArchived: false } {
+  async restoreSessionById(sessionId: string): Promise<{ sessionId: string; isArchived: false }> {
     const session = sessionsDb.getSessionById(sessionId);
     if (!session) {
       throw new AppError(`Session "${sessionId}" was not found.`, {
@@ -778,6 +802,7 @@ export const sessionsService = {
     }
 
     sessionsDb.updateSessionIsArchived(sessionId, false);
+    await announceSidebarChange(broadcastSessionRestored(sessionId));
     return { sessionId, isArchived: false };
   },
 
