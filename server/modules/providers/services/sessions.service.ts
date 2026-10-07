@@ -7,6 +7,7 @@ import { broadcastSessionUpserted, chatRunRegistry } from '@/modules/websocket/i
 import { providerRegistry } from '@/modules/providers/provider.registry.js';
 import { listBusyClaudeCliSessions } from '@/modules/providers/services/claude-cli-liveness.service.js';
 import { sessionHistoryCache } from '@/modules/providers/services/session-history-cache.service.js';
+import { sessionSynchronizerService } from '@/modules/providers/services/session-synchronizer.service.js';
 import type {
   BackgroundTaskSummary,
   FetchHistoryOptions,
@@ -727,6 +728,41 @@ export const sessionsService = {
       action: 'deleted',
       deletedFromDisk: removedFromDisk,
     };
+  },
+
+  /**
+   * Soft-archives a session whose run has just ended (hq fork: the API-key
+   * archive route `POST /api/agent/sessions/:id/archive`).
+   *
+   * The index re-opens an archived row when it sees the transcript newer
+   * than the row's `updated_at` (`sessionsDb.createSession`: new activity
+   * un-archives). The sessions watcher polls every 6 s, so the last lines a
+   * run wrote are usually not indexed yet when its caller archives right
+   * after the response — and the next poll would bring the session back.
+   * The row is therefore brought up to date with its transcript first
+   * (the file when the row knows it; otherwise a scan, which indexes a
+   * transcript not seen yet), then archived. A later poll of the same file
+   * finds nothing newer and leaves it archived; real new activity still
+   * un-archives, as for any archived session.
+   */
+  async archiveSessionAfterRun(
+    sessionId: string,
+  ): Promise<{ sessionId: string; action: 'archived' | 'deleted'; deletedFromDisk: boolean }> {
+    const session = sessionsDb.getSessionById(sessionId);
+    if (!session) {
+      throw new AppError(`Session "${sessionId}" was not found.`, {
+        code: 'SESSION_NOT_FOUND',
+        statusCode: 404,
+      });
+    }
+
+    if (session.jsonl_path) {
+      await sessionSynchronizerService.synchronizeProviderFile(session.provider as LLMProvider, session.jsonl_path);
+    } else {
+      await sessionSynchronizerService.synchronizeSessions();
+    }
+
+    return sessionsService.deleteOrArchiveSessionById(sessionId);
   },
 
   /**

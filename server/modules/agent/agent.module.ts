@@ -54,6 +54,7 @@ export function createAgentModule(externalDependencies: AgentExternalDependencie
       getSessionByProviderSessionId: (providerSessionId) => sessionsDb.getSessionByProviderSessionId(providerSessionId),
       createAppSession: (provider, projectPath, initialMessage) =>
         sessionsService.createAppSession(provider as LLMProvider, projectPath, initialMessage),
+      archiveSession: (sessionId) => sessionsService.archiveSessionAfterRun(sessionId),
     },
     runs: chatRunRegistry,
     GithubClient: Octokit,

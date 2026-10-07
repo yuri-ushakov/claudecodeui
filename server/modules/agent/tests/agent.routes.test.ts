@@ -34,6 +34,7 @@ function createDependencies(
       getSessionById: () => null,
       getSessionByProviderSessionId: () => null,
       createAppSession: () => ({ sessionId: 'app-session-1' }),
+      archiveSession: async () => { throw new Error('archive should not run'); },
     },
     // A registry stand-in: the runtime writes straight to the audience, which
     // is all the tests above this file's registration tests need.
@@ -251,4 +252,54 @@ test('Agent route starts codex on the catalog default when the request names no 
   });
 
   assert.deepEqual(codexCalls.map((call) => call.model), ['catalog-default']);
+});
+
+test('Archive route requires an API key outside platform mode and archives the named session', async () => {
+  const archived: string[] = [];
+  const dependencies = createDependencies({
+    platformMode: false,
+    apiKeys: { validateApiKey: (apiKey) => (apiKey === 'valid-key' ? { id: 1, username: 'test-user' } : undefined) },
+    sessions: {
+      getSessionById: (sessionId) => (sessionId === 'app-1'
+        ? { session_id: 'app-1', provider: 'claude', provider_session_id: 'native-1', project_path: '/home/test/project' }
+        : null),
+      getSessionByProviderSessionId: () => null,
+      createAppSession: () => ({ sessionId: 'unused' }),
+      archiveSession: async (sessionId) => {
+        archived.push(sessionId);
+        return { sessionId, action: 'archived', deletedFromDisk: false };
+      },
+    },
+  });
+
+  await withAgentServer(dependencies, async (baseUrl) => {
+    const withoutKey = await fetch(`${baseUrl}/api/agent/sessions/app-1/archive`, { method: 'POST' });
+    assert.equal(withoutKey.status, 401);
+
+    const badKey = await fetch(`${baseUrl}/api/agent/sessions/app-1/archive`, { method: 'POST', headers: { 'x-api-key': 'nope' } });
+    assert.equal(badKey.status, 401);
+    assert.deepEqual(archived, []);
+
+    const ok = await fetch(`${baseUrl}/api/agent/sessions/app-1/archive`, { method: 'POST', headers: { 'x-api-key': 'valid-key' } });
+    assert.equal(ok.status, 200);
+    assert.deepEqual(await ok.json(), { success: true, sessionId: 'app-1', action: 'archived', deletedFromDisk: false });
+    assert.deepEqual(archived, ['app-1']);
+  });
+});
+
+test('Archive route answers 500 with the service error', async () => {
+  const dependencies = createDependencies({
+    sessions: {
+      getSessionById: () => ({ session_id: 'app-1', provider: 'claude', provider_session_id: null, project_path: null }),
+      getSessionByProviderSessionId: () => null,
+      createAppSession: () => ({ sessionId: 'unused' }),
+      archiveSession: async () => { throw new Error('disk on fire'); },
+    },
+  });
+
+  await withAgentServer(dependencies, async (baseUrl) => {
+    const response = await fetch(`${baseUrl}/api/agent/sessions/app-1/archive`, { method: 'POST' });
+    assert.equal(response.status, 500);
+    assert.deepEqual(await response.json(), { success: false, error: 'disk on fire' });
+  });
 });
