@@ -31,6 +31,8 @@ type AgentRouterDependencies = {
     getSessionById(sessionId: string): AgentSessionRow | null;
     getSessionByProviderSessionId(providerSessionId: string): AgentSessionRow | null;
     createAppSession(provider: string, projectPath: string, initialMessage: string): { sessionId: string };
+    /** Soft archive (no `force`): the row is flagged archived and leaves the sidebar; nothing is removed from disk. */
+    archiveSession(sessionId: string): Promise<{ sessionId: string; action: 'archived' | 'deleted'; deletedFromDisk: boolean }>;
   };
   /** The live-run registry the chat socket uses; registering here is what puts an API run on the running-sessions list. */
   runs: Pick<typeof import('../websocket/index.js').chatRunRegistry, 'startRun' | 'completeRunIfCurrent' | 'isProcessing'>;
@@ -640,6 +642,8 @@ export function createAgentRouter(dependencies: AgentRouterDependencies): expres
    *                             response reported as `sessionId` / in its `session-id` event.
    *                             A session already mid-run is refused (409); an unknown id, 404.
    *                             Omitted: a new session is created for the run.
+   *                             A finished session can be archived with the same API key:
+   *                             POST /api/agent/sessions/:sessionId/archive (below).
    *
    * @param {string} model - (Optional) Model identifier for providers.
    *
@@ -1339,6 +1343,47 @@ export function createAgentRouter(dependencies: AgentRouterDependencies): expres
       if (run) {
         runRegistry.completeRunIfCurrent(run, { exitCode: 1 });
       }
+    }
+  });
+
+  /**
+   * POST /api/agent/sessions/:sessionId/archive
+   *
+   * Archive a session an API caller started (hq fork): the same soft archive
+   * as the sidebar's archive action (`DELETE /api/providers/sessions/:id`
+   * without `force`), reachable with the API key that started the run — the
+   * providers route sits behind the UI's JWT, which an API caller has not.
+   * The row is flagged archived and leaves the session list; the transcript
+   * stays on disk and the session can be restored from the archive.
+   *
+   * @param {string} sessionId - (Path) The app session id a run reported as
+   *                             `sessionId`, or the provider-native id the
+   *                             row is also keyed by (as for `POST /api/agent`).
+   *
+   * Responses:
+   *   200 { success: true, sessionId: "<app id>", action: "archived", deletedFromDisk: false }
+   *   401 { error: "API key required" | "Invalid or inactive API key" }
+   *   404 { success: false, error: 'Session "<id>" was not found' }
+   *   500 { success: false, error: "..." }
+   *
+   * A session mid-run is archived too: archiving only hides the row, and a
+   * caller archives after its run's response, when the registry may not have
+   * closed the run yet.
+   */
+  router.post('/sessions/:sessionId/archive', validateExternalApiKey, async (req, res) => {
+    const requestedId = typeof req.params.sessionId === 'string' ? req.params.sessionId.trim() : '';
+    const sessionRow = requestedId
+      ? sessionGateway.getSessionById(requestedId) ?? sessionGateway.getSessionByProviderSessionId(requestedId)
+      : null;
+    if (!sessionRow) {
+      return res.status(404).json({ success: false, error: `Session "${requestedId}" was not found` });
+    }
+    try {
+      const result = await sessionGateway.archiveSession(sessionRow.session_id);
+      return res.json({ success: true, ...result });
+    } catch (error) {
+      const status = error?.statusCode === 404 ? 404 : 500;
+      return res.status(status).json({ success: false, error: error.message });
     }
   });
 

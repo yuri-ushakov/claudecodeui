@@ -70,6 +70,11 @@ function createDependencies(queryClaude: RunFunction): AgentDependencies {
         sessionsDb.createAppSession(sessionId, provider, projectPath, initialMessage);
         return { sessionId };
       },
+      // The real soft archive the module wires: the flag only, the transcript stays.
+      archiveSession: async (sessionId) => {
+        sessionsDb.updateSessionIsArchived(sessionId, true);
+        return { sessionId, action: 'archived' as const, deletedFromDisk: false };
+      },
     },
     runs: chatRunRegistry,
     queryClaude,
@@ -343,6 +348,34 @@ test('a non-streaming run answers with the assistant\'s replies, its token usage
       assert.equal(body.providerSessionId, 'native-7');
       assert.deepEqual(body.messages.map((message) => message.content), ['pong']);
       assert.deepEqual(body.tokens, { inputTokens: 100, outputTokens: 30, cacheReadTokens: 60, cacheCreationTokens: 10, totalTokens: 130 });
+    });
+  });
+});
+
+test('a finished API run is archived by either id with the API key, and an unknown session is 404', async () => {
+  await withIsolatedDatabase(async () => {
+    const runtime = createHeldRuntime();
+    runtime.release();
+    await withAgentServer(createDependencies(runtime.queryClaude), async (baseUrl) => {
+      const run = await post(baseUrl, { projectPath: '/home/test/project', message: 'Scheduled', stream: false });
+      const { sessionId } = await run.json() as { sessionId: string };
+      assert.equal(sessionsDb.getSessionById(sessionId)?.isArchived, 0);
+
+      const archived = await fetch(`${baseUrl}/api/agent/sessions/${encodeURIComponent(sessionId)}/archive`, { method: 'POST' });
+      assert.equal(archived.status, 200);
+      assert.deepEqual(await archived.json(), { success: true, sessionId, action: 'archived', deletedFromDisk: false });
+      assert.equal(sessionsDb.getSessionById(sessionId)?.isArchived, 1, 'the row is archived, not deleted');
+
+      sessionsDb.createAppSession('app-native', 'claude', '/home/test/project', 'Other');
+      sessionsDb.assignProviderSessionId('app-native', 'native-other');
+      const byNativeId = await fetch(`${baseUrl}/api/agent/sessions/native-other/archive`, { method: 'POST' });
+      assert.equal(byNativeId.status, 200);
+      assert.equal((await byNativeId.json() as { sessionId: string }).sessionId, 'app-native', 'archived under the app id');
+      assert.equal(sessionsDb.getSessionById('app-native')?.isArchived, 1);
+
+      const unknown = await fetch(`${baseUrl}/api/agent/sessions/nope/archive`, { method: 'POST' });
+      assert.equal(unknown.status, 404);
+      assert.deepEqual(await unknown.json(), { success: false, error: 'Session "nope" was not found' });
     });
   });
 });
