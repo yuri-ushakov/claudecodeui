@@ -37,9 +37,15 @@ async function withIsolatedDatabase(runTest: (userId: number) => void | Promise<
 
 type RunCall = { provider: string; command: string; options: Record<string, unknown> };
 
-function createRuntime(runs: RunCall[], behaviour: 'ok' | 'throw' = 'ok', aborts: string[] = []) {
+function createRuntime(
+  runs: RunCall[],
+  behaviour: 'ok' | 'throw' = 'ok',
+  aborts: string[] = [],
+  hasBackgroundWork: (sessionId: string) => boolean = () => false,
+) {
   return {
     hasRuntime: () => true,
+    hasBackgroundWork,
     run: async (provider: string, command: string, options: Record<string, unknown>) => {
       if (behaviour === 'throw') {
         throw new Error('provider exploded');
@@ -114,6 +120,36 @@ test('a queued message stays pending while its session is busy', async () => {
     assert.deepEqual(sessionDraftsDb.getDrafts(userId)[0]?.queuedMessage, {
       content: 'send after this run',
     });
+  });
+});
+
+test('a queued message does not wait for background work (hq fork: the held process survives a new turn)', async () => {
+  await withIsolatedDatabase(async (userId) => {
+    sessionDraftsDb.saveDraft(userId, SESSION_ID, {
+      text: '',
+      queuedMessage: { content: 'send after this run' },
+    });
+    // Turn A ended, so its run is completed; it backgrounded an agent that is
+    // still running under the conversation's held process. With one process
+    // per conversation the next turn goes into that same process and the
+    // agent keeps going, so the queued turn goes on the next pass.
+    const runA = chatRunRegistry.startRun({
+      appSessionId: SESSION_ID,
+      provider: 'claude',
+      providerSessionId: null,
+      connection: null,
+      userId,
+    });
+    runA!.writer.sendComplete({ exitCode: 0 });
+    assert.equal(chatRunRegistry.isProcessing(SESSION_ID), false);
+
+    const runs: RunCall[] = [];
+    const runtime = createRuntime(runs, 'ok', [], (sessionId) => sessionId === SESSION_ID);
+
+    assert.equal(await dispatchQueuedMessages(runtime), 1);
+    assert.equal(runs.length, 1);
+    assert.equal(runs[0].command, 'send after this run');
+    assert.equal(sessionDraftsDb.getDrafts(userId).length, 0);
   });
 });
 
