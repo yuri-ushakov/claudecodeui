@@ -10,7 +10,10 @@ import type { ProviderRuntimeGateway } from '@/modules/websocket/index.js';
  * `(status, scheduled_for)`, so the poll is one cheap query. Anything finer
  * would buy precision nobody asked for.
  */
-const POLL_INTERVAL_MS = 30_000;
+// 5 s rather than 30: a queued draft is what the composer makes of a message
+// typed while a turn runs, and the user is waiting for it to go the moment the
+// session frees. The pass is two cheap reads of the local database.
+const POLL_INTERVAL_MS = 5_000;
 
 let pollTimer: ReturnType<typeof setInterval> | null = null;
 let dispatchInFlight = false;

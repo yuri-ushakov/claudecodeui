@@ -77,7 +77,23 @@ export function stableJson(value) {
  * @returns {boolean}
  */
 export function endsTurn(message) {
-  return message?.type === 'result' && message.origin?.kind !== 'task-notification';
+  if (message?.type !== 'result') {
+    return false;
+  }
+  if (message.origin?.kind !== 'task-notification') {
+    return true;
+  }
+  // A task-notification `result` that ran the model is a follow-up turn the
+  // CLI pushed on its own. When a turn of ours was pushed while that follow-up
+  // was running, the CLI absorbs our message into it (transcript:
+  // `queue-operation remove, reason=absorbed_mid_turn`) and never runs a turn
+  // of its own for it - this `result` is the only one the served turn will
+  // ever get. Taking it for the end keeps the run from staying "running"
+  // forever, which froze the composer (every later message queued as a
+  // draft) and the dispatcher (drafts wait for an idle session) until a
+  // restart - 14.10.2026. The stale resume result keeps `num_turns: 0`
+  // and is still ignored.
+  return (message.num_turns ?? 0) > 0;
 }
 
 /** Held sessions by session key. */
