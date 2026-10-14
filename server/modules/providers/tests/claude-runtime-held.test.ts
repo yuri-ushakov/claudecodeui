@@ -8,6 +8,7 @@ import { ClaudeSessionsProvider } from '@/modules/providers/list/claude/claude-s
 import { CLAUDE_PREDEFINED_MODELS } from '@/modules/providers/list/claude/claude-models.provider.js';
 import { getHeldSession, releaseHeldSession } from '@/modules/providers/list/claude/claude-held-session.js';
 import {
+  abortClaudeSDKSession,
   listClaudeSDKBackgroundWork,
   queryClaudeSDK,
   resolveToolApproval,
@@ -532,5 +533,45 @@ test('a changed allowed-tool list is applied to the held process instead of cost
     assert.equal(script.starts(), 2, 'a disallowed-tool change starts a new process');
     script.emit(result());
     await third;
+  });
+});
+
+test('Stop on a held process interrupts the turn and keeps the process with its background work', async () => {
+  await withConversation('app-held-stop', async ({ script, turn, sessionId }) => {
+    const station = createWriter();
+    const first = turn(station);
+    await settle();
+    script.emit(init());
+    script.emit(toolUse('toolu_agent', 'Agent', { prompt: 'work for a while', run_in_background: true }));
+    script.emit(taskStarted('a1', 'toolu_agent', 'local_agent'));
+    script.emit(ack('toolu_agent', 'Agent launched in background. Task ID: a1', { status: 'async_launched', taskId: 'a1' }));
+    script.emit(result());
+    await first;
+    assert.deepEqual(listClaudeSDKBackgroundWork().map((entry) => entry.tasks.map((task) => task.taskId)), [['a1']]);
+
+    // A second turn is in flight when the user presses Stop.
+    const second = turn(station, 'and now this');
+    await settle();
+    script.emit(say('working on it'));
+    assert.equal(await abortClaudeSDKSession(sessionId), true);
+    await second;
+
+    assert.equal(script.interrupts(), 1, 'the turn was interrupted');
+    assert.equal(script.released(), false, 'the process kept its stdin');
+    assert.equal(script.terminated(), false, 'and was not terminated');
+    assert.deepEqual(listClaudeSDKBackgroundWork().map((entry) => entry.tasks.map((task) => task.taskId)), [['a1']], 'the agent is still tracked');
+
+    // The result the CLI still sends for the interrupted turn lands between turns, harmlessly.
+    script.emit(result());
+    await settle();
+
+    // The next turn is served by the same process.
+    const third = turn(station, 'carry on');
+    await settle();
+    script.emit(say('carrying on'));
+    script.emit(result());
+    await third;
+    assert.equal(script.starts(), 1, 'no new process was started');
+    assert.ok(texts(station).includes('carrying on'));
   });
 });

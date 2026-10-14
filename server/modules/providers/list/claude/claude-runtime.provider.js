@@ -335,7 +335,7 @@ function mapCliOptionsToSDK(options = {}) {
  * @param {Object} writer - WebSocket writer for reconnect support
  * @param {Function} releaseInput - Closes the held stdin stream so the CLI can exit
  */
-function addSession(sessionId, queryInstance, writer = null, releaseInput = null) {
+function addSession(sessionId, queryInstance, writer = null, releaseInput = null, held = null) {
   const existing = activeSessions.get(sessionId);
   // A different live instance under the same key means an earlier run was
   // superseded without being stopped (e.g. an abort that raced run setup and
@@ -366,7 +366,10 @@ function addSession(sessionId, queryInstance, writer = null, releaseInput = null
     status: 'active',
     writer,
     // Re-registered mid-run once the provider session id lands; keep the closer.
-    releaseInput: releaseInput || carried?.releaseInput || null
+    releaseInput: releaseInput || carried?.releaseInput || null,
+    // The held process behind this entry, when there is one: abort treats it
+    // differently from a one-shot process (see abortClaudeSDKSession).
+    held: held || carried?.held || null
   });
   // The history reader reports a background agent as running or stopped by
   // whether this entry exists, and the cached history does not see this map.
@@ -1282,7 +1285,7 @@ async function queryClaudeSDK(command, options = {}, turnWriter, context) {
 
     // Track the query instance for abort capability
     if (sessionKey()) {
-      addSession(sessionKey(), queryInstance, ws, closeProcess);
+      addSession(sessionKey(), queryInstance, ws, closeProcess, heldSession);
     }
 
     // Process streaming messages
@@ -1294,7 +1297,7 @@ async function queryClaudeSDK(command, options = {}, turnWriter, context) {
       if (message.session_id && !capturedSessionId) {
 
         capturedSessionId = message.session_id;
-        addSession(sessionKey(), queryInstance, ws, closeProcess);
+        addSession(sessionKey(), queryInstance, ws, closeProcess, heldSession);
 
         // Set session ID on writer
         if (ws.setSessionId && typeof ws.setSessionId === 'function') {
@@ -1558,6 +1561,16 @@ async function abortClaudeSDKSession(sessionId) {
 
     // Call interrupt() on the query instance
     await session.instance.interrupt();
+
+    // A held process is the conversation's, and its background agents run
+    // inside it: closing it here killed them with the turn (14.10.2026 - two
+    // "Stop"s cost four agents). Only the turn ends; the process, its entry
+    // and its background-work bookkeeping stay, and its own idle timer decides
+    // when it goes.
+    if (session.held && !session.held.closed) {
+      session.held.abandonTurn();
+      return true;
+    }
 
     // Release the held stdin stream; without this the CLI stays up for the rest
     // of the post-turn hold even though the user cancelled.

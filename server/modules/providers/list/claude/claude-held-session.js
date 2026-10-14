@@ -232,6 +232,8 @@ export class HeldClaudeSession {
     this.exitTimer = null;
     /** Set while a turn is being served, so a second one cannot cut in. */
     this.busy = false;
+    /** Settles the turn being served (see `abandonTurn`); null between turns. */
+    this.finishTurn = null;
   }
 
   // ---------------------------------------------------------------- turns
@@ -368,6 +370,7 @@ export class HeldClaudeSession {
         }
         settled = true;
         this.busy = false;
+        this.finishTurn = null;
         this.scheduleIdle();
         if (error) {
           reject(error);
@@ -375,6 +378,7 @@ export class HeldClaudeSession {
           resolve();
         }
       };
+      this.finishTurn = finish;
 
       this.turn = {
         onMessage: (message) => {
@@ -389,6 +393,17 @@ export class HeldClaudeSession {
 
       this.push(promptMessages);
     });
+  }
+
+  /**
+   * Ends the turn being served without waiting for the CLI's `result`: the
+   * host interrupted it. The process stays - it is the conversation's, and
+   * its background agents run inside it - and the next turn may claim it at
+   * once. A `result` the CLI still sends for the interrupted turn arrives
+   * between turns and is harmless.
+   */
+  abandonTurn() {
+    this.finishTurn?.(null);
   }
 
   /**
