@@ -32,13 +32,13 @@ type PluginTab = {
 
 type TabDefinition = BuiltInTab | PluginTab;
 
-// Built-in order: Chat, Files, Shell, Git. Files comes right after Chat so
-// that, with the hq plugins at indexes 1–3 (Board, Reports, Schedules), the
-// row reads Chat, Board, Reports, Schedules, Files, Shell, Git, …
+// Built-in order: Chat, Shell, Files, Git (as upstream). With the hq plugins
+// at indexes 1–4 (Board, Reports, Schedules, Glossary) the row reads Chat,
+// Board, Reports, Schedules, Glossary, Shell, Files, Git, …
 const BASE_TABS: BuiltInTab[] = [
   { kind: 'builtin', id: 'chat',  labelKey: 'tabs.chat',  icon: MessageSquare },
-  { kind: 'builtin', id: 'files', labelKey: 'tabs.files', icon: Folder },
   { kind: 'builtin', id: 'shell', labelKey: 'tabs.shell', icon: Terminal },
+  { kind: 'builtin', id: 'files', labelKey: 'tabs.files', icon: Folder },
   { kind: 'builtin', id: 'git',   labelKey: 'tabs.git',   icon: GitBranch },
 ];
 

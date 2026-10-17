@@ -29,8 +29,8 @@ export type OrderedTabs<B, P> = {
  * order) and each is placed at its index, or at the next free place when that
  * index is already taken by an earlier plugin. An index past the end of the row
  * lands after the last built-in tab, still ahead of the separator. So with the
- * built-in row Chat, Files, Shell, Git and plugins at 1, 2, 3 the bar reads
- * Chat, plugin, plugin, plugin, Files, Shell, Git.
+ * built-in row Chat, Shell, Files, Git and plugins at 1, 2, 3 the bar reads
+ * Chat, plugin, plugin, plugin, Shell, Files, Git.
  */
 export function orderTabs<B, P>(builtIn: B[], plugins: Array<PositionedTab<P>>): OrderedTabs<B, P> {
   const positioned = plugins
