@@ -35,6 +35,8 @@ const installedPlugin: Plugin = {
   serverRunning: false,
   dirName: 'private-demo',
   repoUrl: 'https://git.example.test/acme/private-demo',
+  // hq fork: Plugin.tabOrder (place in the tab strip; null = tail).
+  tabOrder: null,
 };
 
 // `api.plugins.*` calls the global fetch, so stubbing it drives the real
