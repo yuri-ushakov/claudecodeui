@@ -177,6 +177,24 @@ const getNotificationSessionSummary = (
  */
 const SAFARI_IME_RACE_WINDOW_MS = 30;
 
+/**
+ * hq fork: whether this provider's turns go into one process held for the
+ * whole conversation (`claudePermissions.keepSessionAlive`, Claude only). In
+ * that mode a new message does not stop the session's background work, so
+ * the composer does not ask before sending over it. The value is the page's
+ * mirror of the server-side preference, re-read on reconnect and tab return.
+ */
+export function keepsProcessAcrossTurns(provider: LLMProvider): boolean {
+  if (provider !== 'claude') {
+    return false;
+  }
+  const permissions = readUserPreference<{ keepSessionAlive?: unknown }>(
+    PROVIDER_PERMISSION_PREFERENCE_KEYS.claude,
+    {},
+  );
+  return permissions?.keepSessionAlive === true;
+}
+
 export function useChatComposerState({
   selectedProject,
   selectedSession,
@@ -931,8 +949,13 @@ export function useChatComposerState({
       // stopped, or finish where nothing is listening. Sending is the user's
       // call, but not one to make for them — and queueing behind the work,
       // which the server holds until it finishes, is the safe alternative.
+      //
+      // hq fork: with "keep the process alive for the whole conversation" on,
+      // a new turn goes into the held process and its background work
+      // survives, so there is nothing to warn about - send at once, as before
+      // the dialog (the user's call, 20.10.2026). Switch off: upstream dialog.
       const backgroundActivity = processingSessionsRef.current?.get(targetSessionId);
-      if (backgroundActivity?.background) {
+      if (backgroundActivity?.background && !keepsProcessAcrossTurns(provider)) {
         const work = ownBackgroundTasks(backgroundActivity.tasks ?? [])
           .map((task) => describeBackgroundTask(task, t));
         const choice = await askBeforeSendingOverBackgroundWork(work);

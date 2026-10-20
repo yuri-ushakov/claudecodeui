@@ -6,6 +6,7 @@ import { afterEach, beforeEach, test, vi } from 'vitest';
 import '@/modules/i18n';
 import { useChatComposerState } from '@/modules/chat/hooks/useChatComposerState';
 import { clearQueuedMessage, readQueuedMessage } from '@/shared/chatDrafts';
+import { resetUserPreferences, writeUserPreference } from '@/shared/userSettings';
 import type * as ChatDrafts from '@/shared/chatDrafts';
 import type { BackgroundSendChoice, PermissionMode, Project, ProjectSession, SessionActivityMap } from '@/shared/types';
 
@@ -115,6 +116,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  resetUserPreferences();
   vi.unstubAllGlobals();
   localStorage.clear();
 });
@@ -211,4 +213,38 @@ test('a session with nothing in the background sends without asking', async () =
 
   assert.equal(view.result.current.backgroundSendPrompt, null);
   assert.equal(sends().length, 1);
+});
+
+// hq fork: with one process held for the whole conversation, a new turn goes
+// into that process and its background work survives, so the composer sends
+// at once instead of asking (the user's call, 20.10.2026).
+test('hq: with keepSessionAlive on, a send over background work goes out at once without the prompt', async () => {
+  writeUserPreference('claudePermissions', { allowedTools: [], disallowedTools: [], skipPermissions: false, keepSessionAlive: true });
+  const { view, sends } = render(backgroundOnly);
+  await act(async () => { view.result.current.setInput('hello'); });
+
+  await act(async () => {
+    await view.result.current.handleSubmit({ preventDefault: () => undefined } as never);
+  });
+
+  assert.equal(view.result.current.backgroundSendPrompt, null, 'no prompt is opened');
+  assert.equal(sends().length, 1, 'the message is sent straight away');
+  assert.equal(writeQueuedMessage.mock.calls.length, 0, 'and not queued');
+  assert.equal(view.result.current.input, '', 'the composer is cleared as after any send');
+});
+
+test('hq: with keepSessionAlive off, the upstream prompt still asks before sending', async () => {
+  writeUserPreference('claudePermissions', { allowedTools: [], disallowedTools: [], skipPermissions: false, keepSessionAlive: false });
+  const { view, sends } = render(backgroundOnly);
+  await act(async () => { view.result.current.setInput('hello'); });
+
+  const pending = startSubmit(view);
+  await waitFor(() => assert.notEqual(view.result.current.backgroundSendPrompt, null));
+  assert.equal(sends().length, 0, 'nothing is sent while the prompt is open');
+
+  await act(async () => {
+    view.result.current.resolveBackgroundSendPrompt('send');
+    await pending;
+  });
+  assert.equal(sends().length, 1, 'send anyway sends');
 });

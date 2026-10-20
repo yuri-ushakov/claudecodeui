@@ -334,7 +334,7 @@ server/tsconfig.json` — чисто; клиентский `tsc` — 2 стар�
 передаёт `keepSessionAlive`, было и до слияния); `npm test` — 815 тестов, 813 зелёных, 1 пропуск,
 1 падение `plugin-git-failures.test.ts` («host that wants credentials») — только из-за русской
 локали git (тест ищет английский текст stderr; под `LC_ALL=C` файл зелёный); `npm run
-test:client` — 807/807; `npm run build` — код выхода 0, `dist-server` обновлён.
+test:client` — 807/807 (после правки диалога — 809/809); `npm run build` — код выхода 0, `dist-server` обновлён.
 
 Побочно про локаль: если у `cloudcli.service` русский `LANG`, распознавание «git требует
 логин» при установке плагина из приватного репо (#1562) не сработает — будет общее сообщение
