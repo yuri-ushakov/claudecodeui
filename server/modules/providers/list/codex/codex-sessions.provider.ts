@@ -2339,13 +2339,11 @@ export class CodexSessionsProvider implements IProviderSessions {
     }
 
     if (raw.type === 'turn_complete') {
-      return [createNormalizedMessage({
-        id: baseId,
-        sessionId,
-        timestamp: ts,
-        provider: PROVIDER,
-        kind: 'complete',
-      })];
+      // Only the runtime knows whether the SDK stream exits successfully.
+      // It emits complete with exitCode/success after draining the stream;
+      // ending the run here would hide a later failure and drop token usage.
+      // Persisted history uses normalizeHistoryEntry, not this live marker.
+      return [];
     }
     if (raw.type === 'turn_failed') {
       return [createNormalizedMessage({

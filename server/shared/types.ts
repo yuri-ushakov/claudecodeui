@@ -354,6 +354,11 @@ export type CompactionInfo = {
   error?: string | null;
 };
 
+/**
+ * Provider-independent transcript or lifecycle event used by Providers,
+ * WebSocket and Agent. Live events may carry registry sequence numbers;
+ * persisted history entries do not. Only kind `complete` terminates a run.
+ */
 export type NormalizedMessage = {
   id: string;
   /**
