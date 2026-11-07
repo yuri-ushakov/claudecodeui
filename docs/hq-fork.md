@@ -399,6 +399,26 @@ gpt-6.1-sol/terra и default gpt-6.1-sol проверены шестью asserti
 затем `npm ci` прошёл. Кэши npm/Electron и тестовая БД изолированы. Живой checkout и
 сервис этим обновлением не затронуты; выкат остаётся отдельным действием.
 
+## Codex 0.167.0 поверх v1.37.7
+
+`@openai/codex` и `@openai/codex-sdk` закреплены на `0.167.0` через
+`npm install --save-exact`. Сигнатуры `new Codex()`, `startThread`, `resumeThread`,
+`sandboxMode`, `approvalPolicy`, `modelReasoningEffort` и потоковых событий совпадают
+с установленным SDK 0.156.1; добавлено только необязательное поле
+`TurnOptions.cyberAccessProgram`. Вызовы в `codex-runtime.provider.ts` не менялись.
+Профильные тесты Codex: 77 всего, 76 пройдены, 1 пропуск, 0 ошибок. Сборка проходит.
+
+Живая проверка `gpt-6.1-sol` по общему входу **не завершена**: новый бинарь сообщает
+`codex-cli 0.167.0`, но `exec --ephemeral` завершается до запроса к модели с
+`failed to initialize in-process app-server client: Read-only file system`.
+Файловая трассировка показывает попытку открыть `~/.codex/installation_id` с
+`O_RDWR|O_CREAT`, запрещённую sandbox этого агента. Перенос SQLite и логов в
+`/tmp/cc-upd/`, отключение аналитики ошибку не устраняют. Содержимое auth/config
+аккаунта не читалось и не копировалось; общий вход и разрешения не менялись.
+Поэтому устранение исходного HTTP 400 ещё требует проверки в обычном окружении
+владельца аккаунта с доступным для записи Codex home; результат `ok` не заявляется.
+Путь нового бинаря: `node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin/codex`.
+
 ## Известные ограничения
 
 - Follow-up ход фонового агента и ход юзера теперь различаются по `origin` результата
