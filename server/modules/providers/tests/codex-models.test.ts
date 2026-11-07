@@ -9,6 +9,27 @@ const require = createRequire(import.meta.url);
 const findCodexModel = (value: string) =>
   CODEX_PREDEFINED_MODELS.OPTIONS.find((option) => option.value === value);
 
+test('defaults to GPT-6.1 Sol and lists it first', () => {
+  assert.equal(CODEX_PREDEFINED_MODELS.DEFAULT, 'gpt-6.1-sol');
+  assert.equal(CODEX_PREDEFINED_MODELS.OPTIONS[0]?.value, 'gpt-6.1-sol');
+});
+
+test('lists GPT-6.1 models with names and reasoning metadata from codex debug models', () => {
+  for (const [slug, label] of [
+    ['gpt-6.1-sol', 'GPT-6.1-Sol'],
+    ['gpt-6.1-terra', 'GPT-6.1 Terra'],
+  ]) {
+    const model = findCodexModel(slug);
+    assert.equal(model?.label, label);
+    assert.equal(model?.effort?.default, 'low');
+    assert.deepEqual(
+      model?.effort?.values.map((effort) => effort.value),
+      ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'],
+    );
+    assert.equal(CODEX_PREDEFINED_MODELS.OPTIONS.filter((option) => option.value === slug).length, 1);
+  }
+});
+
 test('lists GPT-6 Sol and GPT-6 Luna with the effort levels the Codex CLI accepts', () => {
   const sol = findCodexModel('gpt-6-sol');
   assert.equal(sol?.label, 'GPT-6 Sol');
