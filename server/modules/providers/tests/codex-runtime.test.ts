@@ -5,8 +5,56 @@ import test from 'node:test';
 import { Codex } from '@openai/codex-sdk';
 import type { Thread, ThreadOptions } from '@openai/codex-sdk';
 
+import { CODEX_PREDEFINED_MODELS } from '@/modules/providers/list/codex/codex-models.provider.js';
 import { codexRuntime } from '@/modules/providers/list/codex/codex-runtime.provider.js';
 import type { ProviderRuntimeContext } from '@/shared/index.js';
+
+for (const model of ['gpt-6.1-sol', 'gpt-6.1-terra']) {
+  for (const resumed of [false, true]) {
+    for (const effort of ['low', 'medium', 'high', 'xhigh', 'max', 'ultra', 'default', 'invalid']) {
+      test(`Codex ${resumed ? 'resumes' : 'starts'} ${model} with effort ${effort}`, async (t) => {
+        let capturedOptions: ThreadOptions | undefined;
+        const thread = {
+          id: 'native-thread',
+          async runStreamed() {
+            return { events: (async function* () {
+              yield { type: 'thread.started', thread_id: 'native-thread' };
+            })() };
+          },
+        } as unknown as Thread;
+
+        const start = t.mock.method(Codex.prototype, 'startThread', (options?: ThreadOptions) => {
+          capturedOptions = options;
+          return thread;
+        });
+        const resume = t.mock.method(Codex.prototype, 'resumeThread', (_id: string, options?: ThreadOptions) => {
+          capturedOptions = options;
+          return thread;
+        });
+        const context: ProviderRuntimeContext = {
+          resolveProviderSessionId: () => resumed ? 'native-thread' : null,
+          resolveResumeModel: async () => model,
+          getProviderModels: async () => CODEX_PREDEFINED_MODELS,
+          normalizeMessage: () => [],
+          isProviderInstalled: async () => true,
+        };
+
+        await codexRuntime.run('check reasoning', {
+          sessionId: resumed ? 'app-session' : undefined,
+          model,
+          effort,
+          cwd: process.cwd(),
+        }, { isWebSocketWriter: true, send: () => {} }, context);
+
+        assert.equal(start.mock.callCount(), resumed ? 0 : 1);
+        assert.equal(resume.mock.callCount(), resumed ? 1 : 0);
+        assert.equal(capturedOptions?.model, model);
+        assert.equal(capturedOptions?.modelReasoningEffort,
+          effort === 'default' || effort === 'invalid' ? undefined : effort);
+      });
+    }
+  }
+}
 
 for (const resumed of [false, true]) {
   for (const permissionMode of [undefined, 'default', 'unknown', 'acceptEdits', 'bypassPermissions']) {
