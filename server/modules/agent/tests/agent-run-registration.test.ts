@@ -8,11 +8,14 @@ import path from 'node:path';
 import test from 'node:test';
 
 import express from 'express';
+import { Codex } from '@openai/codex-sdk';
+import type { Thread, TurnOptions } from '@openai/codex-sdk';
 
-import { closeConnection, initializeDatabase, sessionsDb } from '@/modules/database/index.js';
+import { closeConnection, initializeDatabase, sessionsDb, userDb } from '@/modules/database/index.js';
+import { providerModelsService, providerRuntimeService } from '@/modules/providers/index.js';
 import { chatRunRegistry, connectedClients } from '@/modules/websocket/index.js';
-import type { NormalizedMessage } from '@/shared/types.js';
-import { createNormalizedMessage } from '@/shared/utils.js';
+import type { NormalizedMessage } from '@/shared/index.js';
+import { createNormalizedMessage } from '@/shared/index.js';
 
 import { createAgentRouter } from '../agent.routes.js';
 
@@ -107,6 +110,91 @@ const readEvents = async (response: Response): Promise<Array<Record<string, unkn
     .split('\n\n')
     .filter((frame) => frame.startsWith('data: '))
     .map((frame) => JSON.parse(frame.slice('data: '.length)) as Record<string, unknown>);
+
+// Keep the actual provider dispatcher, Codex normalizer, registry and SSE
+// audience wired together: stubbing normalizeMessage hid an early complete.
+for (const outcome of ['success', 'turn.failed', 'turn.failed then throw', 'late stream error', 'abort'] as const) {
+  test(`Codex API emits one terminal complete through the real normalizer and registry: ${outcome}`, async (t) => {
+    await withIsolatedDatabase(async () => {
+      // Real runtimes look up notification preferences for the API caller.
+      userDb.createUser('test-user', 'unused-test-hash');
+      let appSessionId = '';
+      const runtimeMessages: NormalizedMessage[] = [];
+      t.mock.method(providerModelsService, 'getProviderModels', async () => ({ OPTIONS: [], DEFAULT: 'test-model' }));
+      const thread = {
+        id: 'native-codex-completion',
+        async runStreamed(_prompt: unknown, options?: TurnOptions) {
+          return { events: (async function* () {
+            yield { type: 'thread.started', thread_id: 'native-codex-completion' };
+            yield { type: 'item.completed', item: { id: 'answer', type: 'agent_message', text: 'ok' } };
+            if (outcome === 'abort') {
+              assert.equal(await providerRuntimeService.abort('codex', appSessionId), true);
+              assert.equal(options?.signal?.aborted, true);
+              // The chat Stop handler owns completion for an aborted run.
+              chatRunRegistry.completeRun(appSessionId, { exitCode: 1, aborted: true });
+              yield { type: 'turn.completed', usage: { input_tokens: 2, output_tokens: 1 } };
+              throw Object.assign(new Error('aborted'), { name: 'AbortError' });
+            }
+            if (outcome === 'turn.failed' || outcome === 'turn.failed then throw') {
+              yield { type: 'turn.failed', error: { message: 'Turn failed for test' } };
+            } else {
+              yield { type: 'turn.completed', usage: { input_tokens: 2, output_tokens: 1 } };
+            }
+            assert.equal(chatRunRegistry.isProcessing(appSessionId), true, 'only draining the SDK stream can complete a live run');
+            if (outcome === 'late stream error') {
+              yield { type: 'error', message: 'Stream failed for test' };
+            }
+            if (outcome === 'turn.failed then throw' || outcome === 'late stream error') {
+              throw new Error('Codex Exec exited with code 1');
+            }
+          })() };
+        },
+      } as unknown as Thread;
+      t.mock.method(Codex.prototype, 'startThread', () => thread);
+      t.mock.method(console, 'error', () => {});
+      const dependencies = createDependencies(async () => { throw new Error('unexpected Claude run'); });
+      dependencies.queryCodex = async (command, options, writer) => {
+        appSessionId = (options as { sessionId: string }).sessionId;
+        const send = writer.send.bind(writer);
+        t.mock.method(writer, 'send', (message: unknown) => {
+          runtimeMessages.push(message as NormalizedMessage);
+          send(message);
+        });
+        await providerRuntimeService.run('codex', command, options, writer);
+      };
+
+      await withAgentServer(dependencies, async (baseUrl) => {
+        const response = await post(baseUrl, { provider: 'codex', projectPath: '/home/test/project', message: 'Run Codex' });
+        assert.equal(response.status, 200);
+        const events = await readEvents(response);
+        const run = chatRunRegistry.getRun(appSessionId);
+        assert.ok(run);
+        const exitCode = outcome === 'success' ? 0 : 1;
+        for (const messages of [run.events, events]) {
+          const completions = messages.filter((event) => event.kind === 'complete');
+          assert.equal(completions.length, 1);
+          assert.equal(completions[0]?.exitCode, exitCode);
+          assert.equal(completions[0]?.success, outcome === 'success');
+          assert.equal(completions[0]?.aborted, outcome === 'abort');
+          assert.equal(completions[0]?.sessionId, appSessionId);
+        }
+        assert.equal(runtimeMessages.filter((event) => event.kind === 'complete').length, outcome === 'abort' ? 0 : 1,
+          'exactly one completion is produced before registry deduplication; abort is completed by Stop');
+        assert.equal(run.status, 'completed');
+        assert.equal(run.events.at(-1)?.kind, 'complete');
+        assert.ok(events.some((event) => event.kind === 'text' && event.content === 'ok'));
+        if (outcome === 'success') {
+          assert.deepEqual(run.events.find((event) => event.text === 'token_budget')?.tokenBudget, {
+            used: 3, total: 200000, inputTokens: 2, outputTokens: 1, breakdown: { input: 2, output: 1 },
+          });
+        }
+        if (outcome.startsWith('turn.failed')) {
+          assert.equal(events.filter((event) => event.kind === 'error').length, 1, 'SDK wrapper must not duplicate the streamed failure');
+        }
+      });
+    });
+  });
+}
 
 /** A runtime that announces its native session id, streams one text event, and waits to be released before completing. */
 function createHeldRuntime(nativeSessionId = 'native-1') {

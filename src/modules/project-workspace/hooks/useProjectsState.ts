@@ -899,6 +899,8 @@ export function useProjectsState({
         && event.kind !== 'chat_subscribed'
         && event.kind !== 'loading_progress'
         && event.kind !== 'session_upserted'
+        // A scheduled-message banner change is not new session activity.
+        && event.kind !== 'scheduled_messages_changed'
         && event.kind !== 'status'
         && event.kind !== 'stream_end'
         && event.kind !== 'permission_resolved'

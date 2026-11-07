@@ -50,6 +50,8 @@ const renderClaudePermissions = () => render(
     agent="claude"
     skipPermissions={false}
     onSkipPermissionsChange={() => {}}
+    keepSessionAlive={false}
+    onKeepSessionAliveChange={() => {}}
     allowedTools={['Bash(make:*)']}
     onAllowedToolsChange={() => {}}
     disallowedTools={[]}

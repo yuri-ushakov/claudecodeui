@@ -132,7 +132,8 @@ function sendProtocolError(
   ws: WebSocket,
   code: string,
   error: string,
-  sessionId?: string
+  sessionId?: string,
+  extra: AnyRecord = {}
 ): void {
   sendJson(ws, {
     kind: 'protocol_error',
@@ -140,6 +141,7 @@ function sendProtocolError(
     error,
     sessionId: sessionId ?? null,
     timestamp: new Date().toISOString(),
+    ...extra,
   });
 }
 
@@ -458,7 +460,9 @@ async function handleChatAbort(
 
   const success = await dependencies.runtime.abort(run.provider, sessionId);
 
-  chatRunRegistry.completeRun(sessionId, {
+  // Scoped to the run that was stopped: a stop can take a round trip, and a
+  // new run of the session may have started by the time it returns.
+  chatRunRegistry.completeRunIfCurrent(run, {
     exitCode: success ? 0 : 1,
     aborted: true,
   });
@@ -506,6 +510,8 @@ async function handleChatStopTask(
       'NO_SUCH_TASK',
       `Session "${sessionId}" has no running background task "${taskId}".`,
       sessionId,
+      // Names the task so the client can settle a chip whose end it missed.
+      { taskId },
     );
   }
 }
@@ -678,7 +684,7 @@ export async function runDetachedChatTurn(
     // run's own dispatch settles later through completeRunIfCurrent, which is
     // scoped to that run and cannot touch the one started here.
     const aborted = await dependencies.runtime.abort(activeRun.provider, input.sessionId);
-    chatRunRegistry.completeRun(input.sessionId, {
+    chatRunRegistry.completeRunIfCurrent(activeRun, {
       exitCode: aborted ? 0 : 1,
       aborted: true,
     });
