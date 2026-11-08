@@ -659,12 +659,11 @@ export function createAgentRouter(dependencies: AgentRouterDependencies): expres
    *                                       'gpt-5.1-codex', 'gpt-5.1-codex-high', 'gpt-5.1-codex-max',
    *                                       'gpt-5.1-codex-max-high', 'opus-4.1', 'grok', and thinking variants
    *                        Codex models: 'gpt-6.1-sol' (default), 'gpt-6.1-terra', 'gpt-6-astra',
-   *                        'gpt-6-sol', 'gpt-6-luna', 'gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna',
-   *                        'gpt-5.5', 'gpt-5.4', 'gpt-5.4-mini'
+   *                                      'gpt-6-sol', 'gpt-6-luna', 'gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna', 'gpt-5.5'
    *
    * @param {string} effort - (Optional) Reasoning effort for providers/models that support it.
    *                          Claude supports: 'low', 'medium', 'high', 'xhigh', 'max' depending on model.
-   *                          Codex supports: 'low', 'medium', 'high', 'xhigh'.
+   *                          Codex supports: 'low', 'medium', 'high', 'xhigh', 'max', 'ultra' depending on model.
    *                          'default' or omission lets the provider decide.
    *
    * @param {boolean} cleanup - (Optional) Auto-cleanup project directory after completion.
@@ -1054,7 +1053,8 @@ export function createAgentRouter(dependencies: AgentRouterDependencies): expres
           model: model || providerModels?.DEFAULT,
           effort,
           permissionMode: 'bypassPermissions', // Bypass all permissions for API calls
-          turnSource: 'agent'
+          turnSource: 'agent',
+          unattended: true // No person is there to answer an MCP server's request for input
         }, run.writer);
 
       } else if (provider === 'cursor') {

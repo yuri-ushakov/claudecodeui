@@ -25,9 +25,9 @@ conversation»). Тумблер в настройках; при включённ
 (`setModel`/`setPermissionMode`, `applyAllowedTools`). Бонус: ответ приходит быстрее — без
 запуска CLI и без `resume`.
 
-Модули: `server/modules/providers/list/claude/claude-held-session.js` (удерживаемый процесс:
+Модули: `server/modules/providers/list/claude/claude-held-session.ts` (удерживаемый процесс:
 `HeldClaudeSession`, реле writer `LatestTurnWriter`, реестр `heldSessions`),
-`server/modules/providers/list/claude/claude-runtime.provider.js` (`queryClaudeSDK` — выбор
+`server/modules/providers/list/claude/claude-runtime.provider.ts` (`queryClaudeSDK` — выбор
 «переиспользовать / завести новый»), тумблер в `src/modules/settings/...` (`keepSessionAlive`,
 i18n `permissions.keepSessionAlive`).
 
@@ -111,7 +111,7 @@ i18n `permissions.keepSessionAlive`).
    Так было во всех трёх инцидентах (07:42, 07:51, 10:47 UTC; в транскрипте перед каждым —
    `queue-operation` с `<task-notification>` и `promptSource: 'system'`). Теперь один
    владелец вопроса «этот `result` завершает мой ход?» — `endsTurn(message)` в
-   `claude-held-session.js`: `result` с `origin.kind === 'task-notification'` ходом не
+   `claude-held-session.ts`: `result` с `origin.kind === 'task-notification'` ходом не
    считается ни у держателя (`runTurn`), ни у провайдера (`handleTurnMessage`); до конца
    хода такой `result` игнорируется целиком, после — это фоновая работа, отчитавшаяся
    follow-up-ходом (как и раньше: уведомление, отпускание процесса). `result` хода,
@@ -503,7 +503,9 @@ gpt-6.1-sol/terra и default gpt-6.1-sol проверены шестью asserti
 
 Тесты: `server/modules/browser-use/tests/browser-launch.test.ts` (конфиг из env, опции запуска,
 путь исполняемого файла по каналу), `browser-session-views.test.ts` (форма ответов UI/агента,
-скриншот только по запросу). Проба вживую без сервера: `node scripts/hq/browser-launch-probe.mjs`
+скриншот только по запросу), `browser-use.upload.test.ts` (успешная загрузка через
+MCP-маршрут: файлы и имена переданы, в ответе нет снимка, UI-превью обновилось).
+Проба вживую без сервера: `node scripts/hq/browser-launch-probe.mjs`
 (`--online` — плюс `https://httpbin.org/headers`, `--shell` — прежний headless-shell для сравнения;
 нужен собранный `dist-server`).
 
@@ -533,6 +535,10 @@ gpt-6.1-sol/terra и default gpt-6.1-sol проверены шестью asserti
   `localStorage` показывается форма входа, после входа открывается файл. Относительный href
   → тот же origin, поэтому ссылка работает и через tail-адрес с планшета. Крестик закрывает
   вкладку (если её открыл скрипт), иначе ведёт в рабочее пространство.
+
+Бинарные файлы без текстового превью в отдельной `/view` не предлагают скачивание:
+исходные байты доступны только через API проекта. В редакторе с проектом обе кнопки
+скачивания сохранены; фиктивный проект или обход проверки корней не используются.
 
 **Какие пути можно читать — один владелец на сервере:** `server/modules/file-view/`
 (`fileViewPolicy`, `file-view-policy.ts`). Путь разрешён, если после разрешения симлинков
@@ -693,3 +699,61 @@ WantedBy=default.target
 `systemctl --user restart cloudcli.service`, проверить `curl -s 127.0.0.1:3001/api/auth/status`
 и `systemctl --user status cloudcli.service` (в логе строка `Installed at: /home/yuri/Projects/cloudcli`).
 Откат: вернуть `ExecStart=/home/yuri/.nvm/versions/node/v24.12.0/bin/cloudcli`.
+
+
+## Слияние upstream v1.37.8 (ветка `upd/upstream-1.37.8`)
+
+15 upstream-коммитов после v1.37.7, release-коммит `2053f3d7`. База форка —
+`e2b54729`, включая исправление единственного терминального complete Codex (`24c80937`).
+Проверены все 45 коммитов форка вне upstream; прежние возможности сохранены.
+
+Восемь конфликтных файлов: package.json/lock, agent.routes.ts,
+browser-use.service.ts, claude-runtime.provider.ts, codex-models.test.ts,
+chat-websocket.service.ts и session-upsert-broadcast.service.ts.
+
+- Codex CLI/SDK остаются ровно 0.167.0 вместо upstream 0.166; Claude SDK обновлён
+  до 0.3.311. Каталог без дублей, gpt-6.1-sol первый и default, gpt-6.1-terra и
+  уровни effort сохранены. Устаревшие gpt-5.4/mini убраны из стандартного списка
+  upstream: установленный CLI не содержит их метаданных; пользовательские модели
+  не удаляются. Lock проверен npm install --package-lock-only и npm ci.
+- Новое steering отправляет сообщение в stdin того же held-процесса. Ход остаётся
+  занят, пока CLI не прочёл сообщение и не закончил соответствующий follow-up;
+  stale task-notification result по-прежнему отсеивает endsTurn. Для согласования
+  завершения добавлен shouldEndTurn в runTurn, по умолчанию прежний endsTurn.
+  HeldClaudeSession перенесён в TypeScript по стандарту backend; .js-спецификаторы
+  импортов сохраняются по правилам NodeNext.
+- Native side questions используют живой held-процесс и не закрывают его stdin
+  ни после результата основного хода, ни после ответа, пришедшего уже в следующем
+  ходе. При замене процесса fallback учитывает закрытие именно старого экземпляра.
+- MCP elicitation следует последнему writer и режиму текущего хода: чат получает
+  запрос, unattended API-ход сразу decline. Обе смены режима проверены на одном
+  процессе; одноразовый unattended-процесс по-прежнему не задаёт callback SDK.
+- `/api/agent` сохраняет API-key auth, регистрацию прогона, turnSource и маршрут
+  архивации; добавлен upstream unattended. Новая общая WebSocket-рассылка обслуживает
+  также наши session_archived/session_restored, без изменения их payload.
+- Upload-функция браузера использует существующую блокировку и agentSessionView
+  (исправлено после ревью PR #7); UI-превью обновляется, снимок агенту не отправляется.
+  Полный Chromium и явные запросы снимков сохранены.
+- API плагинов mount(container, api), context/onContextChange/rpc и серверный
+  RPC-прокси upstream не менял. tabOrder и порядок вкладок форка сохранены.
+
+Три новых интеграционных теста в claude-runtime-held.test.ts проверяют steering с
+непрочитанным сообщением и сменой writer, native side question между ходами,
+MCP elicitation при переходах API → чат → API. Полные результаты и ограничения
+проверки плагинов: отчёт штаба
+`reports/2026-11-08_hq-cloudcli-upstream-1-37-8_merge.md`.
+
+
+Проверки исходного merge в worktree: npm ci и npm run build — exit 0; typecheck/lint —
+exit 0. Клиент: 158 файлов, 1169/1169; сервер: 1151 всего, 1148 pass, те же два
+skills-fail и один skip, что при 1.37.7; Codex: 102 всего, 101 pass, один прежний
+skip. Профильные Claude held/steer/side-question/elicitation: 56/56. Проверка
+чувствительности двух новых сценариев к наивному merge: 0/2, после восстановления
+исправленного кода — оба зелёные.
+
+Плагины собраны и проверены в изолированной копии: reports 11/11, schedules 73/73,
+glossary 17/17 (со снимком настоящего словаря), board 1390/1397. Семь ошибок board
+относятся к содержимому старых карточек (три без раздела «План», четыре с `revisit: —`),
+а не к API хоста. Для всех четырёх: manifest/tabOrder, asset, mount/container/api,
+смена контекста, настоящий серверный RPC и unmount — OK; POST регистрации отчёта
+проверил передачу JSON-тела и hq_path. Живые плагины не пересобирались.
