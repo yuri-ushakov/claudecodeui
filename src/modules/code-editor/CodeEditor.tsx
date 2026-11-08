@@ -285,6 +285,7 @@ export default function CodeEditor({
 
   // Binary file display
   if (isBinary) {
+    // Original bytes are only available through the project content endpoint.
     return (
       <CodeEditorBinaryFile
         key={`${file.projectId ?? ''}:${file.path}`}
@@ -293,7 +294,7 @@ export default function CodeEditor({
         isFullscreen={isFullscreen}
         onClose={requestClose}
         onToggleFullscreen={() => setIsFullscreen((previous) => !previous)}
-        onDownload={handleDownloadOriginal}
+        onDownload={fileProjectId ? handleDownloadOriginal : undefined}
         title={t('binaryFile.title', 'Binary File')}
         message={t('binaryFile.message', 'The file "{{fileName}}" cannot be displayed in the text editor because it is a binary file.', { fileName: file.name })}
         labels={{

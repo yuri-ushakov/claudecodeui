@@ -503,7 +503,9 @@ gpt-6.1-sol/terra и default gpt-6.1-sol проверены шестью asserti
 
 Тесты: `server/modules/browser-use/tests/browser-launch.test.ts` (конфиг из env, опции запуска,
 путь исполняемого файла по каналу), `browser-session-views.test.ts` (форма ответов UI/агента,
-скриншот только по запросу). Проба вживую без сервера: `node scripts/hq/browser-launch-probe.mjs`
+скриншот только по запросу), `browser-use.upload.test.ts` (успешная загрузка через
+MCP-маршрут: файлы и имена переданы, в ответе нет снимка, UI-превью обновилось).
+Проба вживую без сервера: `node scripts/hq/browser-launch-probe.mjs`
 (`--online` — плюс `https://httpbin.org/headers`, `--shell` — прежний headless-shell для сравнения;
 нужен собранный `dist-server`).
 
@@ -533,6 +535,10 @@ gpt-6.1-sol/terra и default gpt-6.1-sol проверены шестью asserti
   `localStorage` показывается форма входа, после входа открывается файл. Относительный href
   → тот же origin, поэтому ссылка работает и через tail-адрес с планшета. Крестик закрывает
   вкладку (если её открыл скрипт), иначе ведёт в рабочее пространство.
+
+Бинарные файлы без текстового превью в отдельной `/view` не предлагают скачивание:
+исходные байты доступны только через API проекта. В редакторе с проектом обе кнопки
+скачивания сохранены; фиктивный проект или обход проверки корней не используются.
 
 **Какие пути можно читать — один владелец на сервере:** `server/modules/file-view/`
 (`fileViewPolicy`, `file-view-policy.ts`). Путь разрешён, если после разрешения симлинков
@@ -725,8 +731,9 @@ chat-websocket.service.ts и session-upsert-broadcast.service.ts.
 - `/api/agent` сохраняет API-key auth, регистрацию прогона, turnSource и маршрут
   архивации; добавлен upstream unattended. Новая общая WebSocket-рассылка обслуживает
   также наши session_archived/session_restored, без изменения их payload.
-- Upload-функция браузера использует существующую блокировку и publicSessionView;
-  полный Chromium и политика скриншотов форка сохранены.
+- Upload-функция браузера использует существующую блокировку и agentSessionView
+  (исправлено после ревью PR #7); UI-превью обновляется, снимок агенту не отправляется.
+  Полный Chromium и явные запросы снимков сохранены.
 - API плагинов mount(container, api), context/onContextChange/rpc и серверный
   RPC-прокси upstream не менял. tabOrder и порядок вкладок форка сохранены.
 
@@ -737,7 +744,7 @@ MCP elicitation при переходах API → чат → API. Полные �
 `reports/2026-11-08_hq-cloudcli-upstream-1-37-8_merge.md`.
 
 
-Итоговые проверки в worktree: npm ci и npm run build — exit 0; typecheck/lint —
+Проверки исходного merge в worktree: npm ci и npm run build — exit 0; typecheck/lint —
 exit 0. Клиент: 158 файлов, 1169/1169; сервер: 1151 всего, 1148 pass, те же два
 skills-fail и один skip, что при 1.37.7; Codex: 102 всего, 101 pass, один прежний
 skip. Профильные Claude held/steer/side-question/elicitation: 56/56. Проверка

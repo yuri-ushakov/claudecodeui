@@ -845,7 +845,7 @@ export const browserUseService = {
       await handle.page.locator(selector).first().setInputFiles(files, { timeout: 10_000 });
       session.lastAction = `upload_files:${files.length}`;
       await captureSession(session, handle.page);
-      return { session: publicSessionView(session), uploaded: files.map((file) => path.basename(file)) };
+      return { session: agentSessionView(session), uploaded: files.map((file) => path.basename(file)) };
     });
   },
 

@@ -112,3 +112,16 @@ test('a failed download is reported and can be retried', async () => {
   await waitFor(() => assert.equal(downloads.length, 1));
   assert.equal(screen.queryByRole('alert'), null);
 });
+
+test.each([false, true])('a standalone viewer hides unsupported binary downloads (sidebar: %s)', async (isSidebar) => {
+  const onClose = vi.fn();
+  render(<CodeEditor file={{ name: file.name, path: file.path }} onClose={onClose} isSidebar={isSidebar} />);
+
+  await screen.findByText('Binary File');
+  assert.equal(screen.queryAllByRole('button', { name: 'Download original file' }).length, 0);
+  assert.equal(screen.queryByRole('alert'), null);
+  assert.equal(readFileBlob.mock.calls.length, 0);
+  assert.equal(downloads.length, 0);
+  fireEvent.click(screen.getAllByRole('button', { name: 'Close' }).at(-1)!);
+  assert.equal(onClose.mock.calls.length, 1);
+});

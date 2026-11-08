@@ -9,8 +9,8 @@ type CodeEditorBinaryFileProps = {
   isFullscreen: boolean;
   onClose: () => void;
   onToggleFullscreen: () => void;
-  /** Saves the file's original bytes; rejects when the download fails. */
-  onDownload: () => Promise<void>;
+  /** Saves original bytes; omitted when the document source cannot provide them. */
+  onDownload?: () => Promise<void>;
   title: string;
   message: string;
   labels: {
@@ -23,9 +23,8 @@ type CodeEditorBinaryFileProps = {
 
 /**
  * Rendered by CodeEditor inside the code-editor module when the opened file is
- * binary and cannot be edited as text. Offers the original file as a download,
- * since a file opened from a chat link would otherwise have to be found again
- * in the Files tab.
+ * binary and cannot be edited as text. Offers the original file as a download
+ * when CodeEditor supplies a source for its bytes.
  */
 export default function CodeEditorBinaryFile({
   file,
@@ -44,7 +43,7 @@ export default function CodeEditorBinaryFile({
   const [downloadFailed, setDownloadFailed] = useState(false);
 
   const startDownload = async () => {
-    if (isDownloading) return;
+    if (!onDownload || isDownloading) return;
     setIsDownloading(true);
     setDownloadFailed(false);
     try {
@@ -57,7 +56,7 @@ export default function CodeEditorBinaryFile({
     }
   };
 
-  const headerDownloadButton = (
+  const headerDownloadButton = onDownload && (
     <button
       type="button"
       onClick={() => void startDownload()}
@@ -83,17 +82,19 @@ export default function CodeEditorBinaryFile({
           <p className="text-sm text-muted-foreground">{message}</p>
         </div>
         <div className="mt-4 flex flex-wrap items-center justify-center gap-2">
-          <button
-            type="button"
-            onClick={() => void startDownload()}
-            disabled={isDownloading}
-            className="flex items-center gap-2 rounded-md bg-primary px-4 py-2 text-sm text-primary-foreground transition-colors hover:bg-primary/90 disabled:opacity-60"
-          >
-            {isDownloading
-              ? <Loader2 className="h-4 w-4 animate-spin" />
-              : <Download className="h-4 w-4" />}
-            {isDownloading ? labels.downloading : labels.download}
-          </button>
+          {onDownload && (
+            <button
+              type="button"
+              onClick={() => void startDownload()}
+              disabled={isDownloading}
+              className="flex items-center gap-2 rounded-md bg-primary px-4 py-2 text-sm text-primary-foreground transition-colors hover:bg-primary/90 disabled:opacity-60"
+            >
+              {isDownloading
+                ? <Loader2 className="h-4 w-4 animate-spin" />
+                : <Download className="h-4 w-4" />}
+              {isDownloading ? labels.downloading : labels.download}
+            </button>
+          )}
           <button
             type="button"
             onClick={onClose}
