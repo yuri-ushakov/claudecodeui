@@ -9,6 +9,8 @@ import { CLAUDE_PREDEFINED_MODELS } from '@/modules/providers/list/claude/claude
 import { getHeldSession, releaseHeldSession } from '@/modules/providers/list/claude/claude-held-session.js';
 import {
   abortClaudeSDKSession,
+  claudeRuntime,
+  steerClaudeSDKSession,
   listClaudeSDKBackgroundWork,
   queryClaudeSDK,
   resolveToolApproval,
@@ -37,6 +39,8 @@ type ScriptedProcess = {
   terminated: () => boolean;
   /** The options it was started with; its callbacks live here. */
   options: () => AnyRecord;
+  stdin: AnyRecord[];
+  setNativeAsk: (ask: () => Promise<unknown>) => void;
 };
 
 type Scripted = ScriptedProcess & {
@@ -64,9 +68,11 @@ function createScriptedQuery(): { createQuery: NonNullable<ProviderRuntimeContex
     let released = false;
     let interrupts = 0;
     let terminated = false;
+    const stdin: AnyRecord[] = [];
+    let nativeAsk: () => Promise<unknown> = async () => ({ response: 'native answer', synthetic: false });
 
     void (async () => {
-      for await (const _message of prompt) { /* the CLI reads its stdin */ }
+      for await (const message of prompt) { stdin.push(message as AnyRecord); }
       released = true;
     })();
 
@@ -92,12 +98,15 @@ function createScriptedQuery(): { createQuery: NonNullable<ProviderRuntimeContex
       interrupts: () => interrupts,
       terminated: () => terminated,
       options: () => options,
+      stdin,
+      setNativeAsk: (ask) => { nativeAsk = ask; },
     };
     processes.push(process);
 
     return Object.assign(iterator, {
       interrupt: async () => { interrupts += 1; },
       stopTask: async () => {},
+      askSideQuestion: () => nativeAsk(),
       setModel: async () => {},
       setPermissionMode: async () => {},
       close: () => { terminated = true; process.end(); },
@@ -111,6 +120,8 @@ function createScriptedQuery(): { createQuery: NonNullable<ProviderRuntimeContex
     interrupts: () => latest().interrupts(),
     terminated: () => latest().terminated(),
     options: () => latest().options(),
+    get stdin() { return latest()?.stdin ?? []; },
+    setNativeAsk: (ask) => latest().setNativeAsk(ask),
     starts: () => processes.length,
     process: (index) => processes[index],
   };
@@ -124,6 +135,7 @@ type Harness = {
   turn: (writer: Writer, command?: string, overrides?: AnyRecord) => Promise<unknown>;
   sessionId: string;
   cwd: string;
+  context: ProviderRuntimeContext;
 };
 
 async function withConversation(
@@ -149,7 +161,7 @@ async function withConversation(
   );
 
   try {
-    await runTest({ script, turn, sessionId, cwd });
+    await runTest({ script, turn, sessionId, cwd, context });
   } finally {
     releaseHeldSession(sessionId);
     for (let index = 0; index < script.starts(); index += 1) {
@@ -573,5 +585,119 @@ test('Stop on a held process interrupts the turn and keeps the process with its 
     await third;
     assert.equal(script.starts(), 1, 'no new process was started');
     assert.ok(texts(station).includes('carrying on'));
+  });
+});
+
+
+test('hq: held steering waits for unread messages and the next writer reuses the process', { timeout: 5000 }, async () => {
+  await withConversation('app-held-steering', async ({ script, turn, sessionId }) => {
+    const station = createWriter();
+    let finished = false;
+    const first = turn(station).then(() => { finished = true; });
+    await settle();
+    script.emit(init());
+    await settle();
+    const messageId = '0b5c3f8e-6d1a-4c2b-9e7f-1a2b3c4d5e6f';
+    assert.equal(await steerClaudeSDKSession(sessionId, 'one more thing', { messageId }), true);
+    await settle();
+    assert.equal(script.stdin[1]?.priority, 'next');
+    assert.equal(script.stdin[1]?.uuid, messageId);
+    script.emit(orphanSettled());
+    script.emit(result());
+    await settle();
+    assert.equal(finished, false, 'unread steering keeps this run active');
+    assert.equal(getHeldSession(sessionId)?.busy, true);
+    assert.equal(kinds(station).includes('complete'), false);
+
+    script.emit(init());
+    script.emit({ type: 'user', session_id: NATIVE_ID, isReplay: true, uuid: messageId,
+      message: { role: 'user', content: 'one more thing' } });
+    script.emit(result());
+    await first;
+    assert.equal(kinds(station).filter((kind) => kind === 'complete').length, 1);
+    assert.equal(script.released(), false);
+
+    const tablet = createWriter();
+    const second = turn(tablet, 'next turn');
+    await settle();
+    const secondId = '9a9a9a9a-0000-4000-8000-000000000000';
+    assert.equal(await steerClaudeSDKSession(sessionId, 'also this', { messageId: secondId }), true);
+    script.emit({ type: 'user', session_id: NATIVE_ID, isReplay: true, uuid: secondId,
+      message: { role: 'user', content: 'also this' } });
+    script.emit(result());
+    await second;
+    assert.equal(script.starts(), 1);
+    assert.equal(script.stdin.length, 4);
+    assert.equal(script.released(), false);
+    assert.equal(kinds(tablet).filter((kind) => kind === 'complete').length, 1);
+  });
+});
+
+test('hq: a native side question across held turns never releases the conversation process', { timeout: 5000 }, async () => {
+  await withConversation('app-held-native-question', async ({ script, turn, sessionId, cwd, context }) => {
+    const first = turn(createWriter());
+    await settle();
+    script.emit(init());
+    await settle();
+    let answer!: (value: unknown) => void;
+    script.setNativeAsk(() => new Promise((resolve) => { answer = resolve; }));
+    const deltas: string[] = [];
+    const question = claudeRuntime.askSideQuestion({
+      appSessionId: sessionId, providerSessionId: NATIVE_ID, question: 'where?', projectPath: cwd,
+      model: null, signal: new AbortController().signal,
+    }, { delta: (text: string) => { deltas.push(text); } }, context);
+    await settle();
+    script.emit(result());
+    await first;
+    assert.equal(script.released(), false, 'turn completion leaves held stdin open');
+    const second = turn(createWriter(), 'next turn');
+    await settle();
+    answer({ response: 'native answer', synthetic: false });
+    assert.equal((await question).status, 'done');
+    assert.deepEqual(deltas, ['native answer']);
+    assert.equal(script.released(), false, 'settling a pending question never closes the next turn');
+    script.emit(result());
+    await second;
+    assert.equal(script.starts(), 1);
+    assert.equal(script.released(), false);
+  });
+});
+
+
+test('hq: held MCP elicitation follows chat and unattended API turns in both directions', { timeout: 5000 }, async () => {
+  await withConversation('app-held-elicitation', async ({ script, turn }) => {
+    const apiWriter = createWriter();
+    const first = turn(apiWriter, 'API turn', { unattended: true });
+    await settle();
+    const onElicitation = script.options().onElicitation;
+    const request = { serverName: 'test-server', message: 'Choose a target', mode: 'form' };
+    const elicitationOptions = { signal: new AbortController().signal };
+    assert.deepEqual(await onElicitation(request, elicitationOptions), { action: 'decline' });
+    assert.equal(kinds(apiWriter).includes('permission_request'), false);
+    script.emit(init());
+    script.emit(result());
+    await first;
+
+    const chatWriter = createWriter();
+    const second = turn(chatWriter, 'chat turn');
+    await settle();
+    const pending = onElicitation(request, elicitationOptions);
+    await settle();
+    const approval = chatWriter.received.find((message) => message.kind === 'permission_request');
+    assert.ok(approval, 'the callback from an API-started process now asks the chat audience');
+    resolveToolApproval(approval.requestId as string, { allow: false });
+    assert.deepEqual(await pending, { action: 'decline' });
+    script.emit(result());
+    await second;
+
+    const lastWriter = createWriter();
+    const third = turn(lastWriter, 'API turn again', { unattended: true });
+    await settle();
+    assert.deepEqual(await onElicitation(request, elicitationOptions), { action: 'decline' });
+    assert.equal(kinds(lastWriter).includes('permission_request'), false);
+    script.emit(result());
+    await third;
+    assert.equal(script.starts(), 1, 'changing elicitation policy never replaces the conversation process');
+    assert.equal(script.released(), false);
   });
 });

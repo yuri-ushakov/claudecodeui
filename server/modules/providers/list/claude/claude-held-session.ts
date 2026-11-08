@@ -1,3 +1,5 @@
+import type { AnyRecord, ProviderRuntimeContext } from '@/shared/types.js';
+
 /**
  * A Claude CLI process kept alive across the turns of one conversation.
  *
@@ -45,10 +47,11 @@
  */
 
 /**
+ * Used by the Claude runtime and held-session tests.
  * JSON with object keys in a fixed order, so two equal configurations always
  * produce the same string - whatever order they were written in.
  */
-export function stableJson(value) {
+export function stableJson(value: unknown) {
   return JSON.stringify(value, (_key, entry) => (
     entry && typeof entry === 'object' && !Array.isArray(entry)
       ? Object.fromEntries(Object.keys(entry).sort().map((key) => [key, entry[key]]))
@@ -57,6 +60,7 @@ export function stableJson(value) {
 }
 
 /**
+ * Used by the Claude runtime and held-session tests.
  * Whether an SDK message is the `result` that ends the turn being served.
  *
  * The CLI emits a `result` for every prompt it settles, and not all of them
@@ -76,7 +80,7 @@ export function stableJson(value) {
  * @param {Object} message - Raw SDK message
  * @returns {boolean}
  */
-export function endsTurn(message) {
+export function endsTurn(message: AnyRecord | null | undefined) {
   if (message?.type !== 'result') {
     return false;
   }
@@ -97,7 +101,7 @@ export function endsTurn(message) {
 }
 
 /** Held sessions by session key. */
-const heldSessions = new Map();
+const heldSessions = new Map<string, HeldClaudeSession>();
 
 /** How long a session may sit idle, with nothing outstanding, before its process is let go. */
 const DEFAULT_IDLE_MS = 10 * 60 * 1000;
@@ -114,6 +118,7 @@ const DEFAULT_EXIT_GRACE_MS = 5000;
 const FIXED_AT_STARTUP = ['cwd', 'mcp', 'effort', 'disallowedTools'];
 
 /**
+ * Used by the Claude runtime and held-session tests to forward events across devices.
  * The writer of whichever turn was served last.
  *
  * Exposes the surface the runtime relies on (`send`, `setSessionId`, `userId`,
@@ -121,10 +126,11 @@ const FIXED_AT_STARTUP = ['cwd', 'mcp', 'effort', 'disallowedTools'];
  * once per held process; the target is switched every time a turn starts.
  */
 export class LatestTurnWriter {
+  current: AnyRecord | null;
   /**
    * @param {Object|null} writer - Writer of the turn that starts the process
    */
-  constructor(writer = null) {
+  constructor(writer: AnyRecord | null = null) {
     /** The writer of the turn being served, or of the last one served. */
     this.current = writer;
   }
@@ -133,7 +139,7 @@ export class LatestTurnWriter {
    * Points the relay at a new turn's writer.
    * @param {Object|null} writer - Writer of the turn about to be served
    */
-  switchTo(writer) {
+  switchTo(writer: AnyRecord | null) {
     this.current = writer;
   }
 
@@ -141,7 +147,7 @@ export class LatestTurnWriter {
    * Forwards one event to the current writer.
    * @param {unknown} data - Normalized message
    */
-  send(data) {
+  send(data: unknown) {
     this.current?.send(data);
   }
 
@@ -149,7 +155,7 @@ export class LatestTurnWriter {
    * Labels the current writer with the provider-native session id, when it can take one.
    * @param {string} sessionId - Provider-native session id
    */
-  setSessionId(sessionId) {
+  setSessionId(sessionId: string) {
     if (typeof this.current?.setSessionId === 'function') {
       this.current.setSessionId(sessionId);
     }
@@ -159,7 +165,7 @@ export class LatestTurnWriter {
    * Adds a socket to the current writer's audience, when it keeps one.
    * @param {Object} connection - Raw websocket connection
    */
-  updateWebSocket(connection) {
+  updateWebSocket(connection: unknown) {
     if (typeof this.current?.updateWebSocket === 'function') {
       this.current.updateWebSocket(connection);
     }
@@ -176,7 +182,38 @@ export class LatestTurnWriter {
   }
 }
 
+/** Used by the Claude runtime and its tests to keep one process across conversation turns. */
 export class HeldClaudeSession {
+  sessionKey: string;
+  fingerprint: AnyRecord;
+  idleMs: number;
+  backgroundWorkCeilingMs: number;
+  exitGraceMs: number;
+  onEnd: (session: HeldClaudeSession, error: Error | null) => void;
+  startedAt: number | null;
+  writer: LatestTurnWriter;
+  instance: (ReturnType<NonNullable<ProviderRuntimeContext['createQuery']>> & {
+    setModel?: (model: string) => Promise<void>;
+    setPermissionMode?: (mode: string) => Promise<void>;
+    close?: () => void;
+  }) | null;
+  sdkOptions: AnyRecord | null;
+  appliedAllowedTools: string[];
+  release: () => void;
+  turn: {
+    onMessage: (message: AnyRecord) => void;
+    onError: (error: Error | null) => void;
+    isHoldingForBackgroundWork: () => boolean;
+  } | null;
+  queue: unknown[];
+  wake: (() => void) | null;
+  closed: boolean;
+  idleTimer: ReturnType<typeof setTimeout> | null;
+  exitTimer: ReturnType<typeof setTimeout> | null;
+  busy: boolean;
+  /** The latest turn has nobody available to answer an MCP elicitation. */
+  unattended = false;
+  finishTurn: ((error: Error | null) => void) | null;
   /**
    * @param {Object} args
    * @param {string} args.sessionKey - Key this session is registered under
@@ -195,6 +232,14 @@ export class HeldClaudeSession {
     backgroundWorkCeilingMs = DEFAULT_IDLE_MS,
     exitGraceMs = DEFAULT_EXIT_GRACE_MS,
     onEnd = () => {},
+  }: {
+    sessionKey: string;
+    fingerprint: AnyRecord;
+    writer?: AnyRecord | null;
+    idleMs?: number;
+    backgroundWorkCeilingMs?: number;
+    exitGraceMs?: number;
+    onEnd?: (session: HeldClaudeSession, error: Error | null) => void;
   }) {
     this.sessionKey = sessionKey;
     this.fingerprint = fingerprint;
@@ -282,15 +327,15 @@ export class HeldClaudeSession {
    * @param {string} [turn.permissionMode] - The permission mode it asks for
    * @param {string[]} [turn.allowedTools] - Its tool list, mode entries included
    */
-  async applyTurn({ model, permissionMode, allowedTools }) {
+  async applyTurn({ model, permissionMode, allowedTools }: { model?: string; permissionMode?: string; allowedTools?: string[] }) {
     if (model && model !== this.fingerprint.model) {
-      await this.instance.setModel(model);
+      await this.instance!.setModel!(model);
       this.fingerprint.model = model;
     }
 
     const mode = permissionMode || 'default';
     if (mode !== this.fingerprint.permissionMode) {
-      await this.instance.setPermissionMode(mode);
+      await this.instance!.setPermissionMode!(mode);
       this.fingerprint.permissionMode = mode;
       // `canUseTool` reads the mode off the options object it was built with,
       // so the new mode has to land there too - otherwise turning off
@@ -317,13 +362,13 @@ export class HeldClaudeSession {
    *
    * @param {string[]} [allowedTools] - This turn's list; anything else is ignored
    */
-  applyAllowedTools(allowedTools) {
+  applyAllowedTools(allowedTools?: string[]) {
     if (!this.sdkOptions || !Array.isArray(allowedTools)) {
       return;
     }
 
     const remembered = (this.sdkOptions.allowedTools || [])
-      .filter((tool) => !this.appliedAllowedTools.includes(tool) && !allowedTools.includes(tool));
+      .filter((tool: string) => !this.appliedAllowedTools.includes(tool) && !allowedTools.includes(tool));
 
     this.sdkOptions.allowedTools = [...allowedTools, ...remembered];
     this.appliedAllowedTools = [...allowedTools];
@@ -345,7 +390,15 @@ export class HeldClaudeSession {
    * @param {boolean} [args.reserved] - Whether the caller already claimed it
    * @returns {Promise<void>}
    */
-  runTurn({ promptMessages, onMessage, writer = null, isHoldingForBackgroundWork = () => false, reserved = false }) {
+  runTurn({ promptMessages, onMessage, writer = null, isHoldingForBackgroundWork = () => false, reserved = false, shouldEndTurn = endsTurn }: {
+    promptMessages: unknown[];
+    onMessage: (message: AnyRecord) => void;
+    writer?: AnyRecord | null;
+    isHoldingForBackgroundWork?: () => boolean;
+    reserved?: boolean;
+    /** The runtime waits for unread steered messages before settling the run. */
+    shouldEndTurn?: (message: AnyRecord) => boolean;
+  }): Promise<void> {
     if (this.closed || !this.instance) {
       if (reserved) {
         this.busy = false;
@@ -362,9 +415,9 @@ export class HeldClaudeSession {
       this.writer.switchTo(writer);
     }
 
-    return new Promise((resolve, reject) => {
+    return new Promise<void>((resolve, reject) => {
       let settled = false;
-      const finish = (error) => {
+      const finish = (error: Error | null) => {
         if (settled) {
           return;
         }
@@ -383,7 +436,7 @@ export class HeldClaudeSession {
       this.turn = {
         onMessage: (message) => {
           onMessage(message);
-          if (endsTurn(message)) {
+          if (shouldEndTurn(message)) {
             finish(null);
           }
         },
@@ -418,7 +471,7 @@ export class HeldClaudeSession {
    * @param {Object} fingerprint - What the next turn would start a process with
    * @returns {boolean}
    */
-  matches(fingerprint) {
+  matches(fingerprint: AnyRecord) {
     return !this.closed
       && this.instance !== null
       && this.mismatches(fingerprint).length === 0;
@@ -438,7 +491,7 @@ export class HeldClaudeSession {
    * @param {Object} fingerprint - What the next turn would start a process with
    * @returns {string[]} Names of the differing conditions; empty when it fits
    */
-  mismatches(fingerprint) {
+  mismatches(fingerprint: AnyRecord) {
     return FIXED_AT_STARTUP.filter((field) => this.fingerprint[field] !== fingerprint[field]);
   }
 
@@ -460,7 +513,7 @@ export class HeldClaudeSession {
         return;
       }
 
-      await new Promise((resolve) => {
+      await new Promise<void>((resolve) => {
         this.wake = resolve;
       });
       this.wake = null;
@@ -471,7 +524,7 @@ export class HeldClaudeSession {
    * Queues messages for the CLI and wakes the stream if it is waiting.
    * @param {Array<Object>} messages - SDKUserMessage records
    */
-  push(messages) {
+  push(messages: unknown[]) {
     for (const message of messages) {
       this.queue.push(message);
     }
@@ -489,8 +542,9 @@ export class HeldClaudeSession {
    * @param {() => void} release - Closes stdin so the CLI can exit
    * @param {Record<string, unknown>|null} [sdkOptions] - The options it was started with
    */
-  start(instance, release, sdkOptions = null) {
-    this.instance = instance;
+  start(instance: AsyncIterable<any>, release: () => void, sdkOptions: AnyRecord | null = null) {
+    // Production supplies the SDK query; unit streams exercise the lifecycle without a CLI.
+    this.instance = instance as NonNullable<HeldClaudeSession['instance']>;
     this.release = release;
     this.sdkOptions = sdkOptions;
     this.startedAt = Date.now();
@@ -515,17 +569,17 @@ export class HeldClaudeSession {
    * Every message also counts as activity for the idle timer.
    */
   async consume() {
-    let failure = null;
+    let failure: Error | null = null;
     try {
-      for await (const message of this.instance) {
-        this.turn?.onMessage(message);
+      for await (const message of this.instance!) {
+        this.turn?.onMessage(message as AnyRecord);
         if (!this.busy) {
           this.scheduleIdle();
         }
       }
     } catch (error) {
-      failure = error;
-      this.turn?.onError(error);
+      failure = error instanceof Error ? error : new Error(String(error));
+      this.turn?.onError(failure);
     } finally {
       this.closed = true;
       this.clearIdle();
@@ -609,9 +663,9 @@ export class HeldClaudeSession {
     this.exitTimer = setTimeout(() => {
       this.exitTimer = null;
       try {
-        this.instance.close();
+        this.instance?.close?.();
       } catch (error) {
-        console.error(`[Claude SDK] Could not terminate the held process for session ${this.sessionKey}:`, error?.message || error);
+        console.error(`[Claude SDK] Could not terminate the held process for session ${this.sessionKey}:`, error instanceof Error ? error.message : error);
       }
     }, this.exitGraceMs);
     this.exitTimer.unref?.();
@@ -626,13 +680,13 @@ export class HeldClaudeSession {
   }
 }
 
-/** The session held for this key, if there is one. */
-export function getHeldSession(sessionKey) {
+/** Used by the Claude runtime and lifecycle tests to find the conversation process. */
+export function getHeldSession(sessionKey: string | null | undefined) {
   return sessionKey ? heldSessions.get(sessionKey) || null : null;
 }
 
-/** Registers a session under its key, replacing whatever was there. */
-export function holdSession(session) {
+/** Used by the Claude runtime and lifecycle tests to register a conversation process. */
+export function holdSession(session: HeldClaudeSession) {
   const previous = heldSessions.get(session.sessionKey);
   if (previous && previous !== session) {
     previous.close();
@@ -640,13 +694,13 @@ export function holdSession(session) {
   heldSessions.set(session.sessionKey, session);
 }
 
-/** Ends the held session for this key, if any. */
-export function releaseHeldSession(sessionKey) {
+/** Used by the providers adapter and tests to close one conversation process. */
+export function releaseHeldSession(sessionKey: string) {
   const session = getHeldSession(sessionKey);
   session?.close();
 }
 
-/** Ends every held session - used when the server winds down. */
+/** Used by provider shutdown and tests to close every held conversation process. */
 export function releaseAllHeldSessions() {
   for (const session of Array.from(heldSessions.values())) {
     session.close();
