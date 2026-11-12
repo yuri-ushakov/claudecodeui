@@ -51,6 +51,7 @@ import {
   rememberClaudeContextWindow
 } from '@/modules/providers/services/provider-token-usage.service.js';
 import { createCompleteMessage, createNormalizedMessage, errorMessage } from '@/shared/utils.js';
+import { BG_WAIT_CEILING_MS as HELD_BG_WAIT_CEILING_MS } from './claude-hold-ceilings.js';
 import type {
   AnyRecord,
   BackgroundTaskSummary,
@@ -163,7 +164,8 @@ const TOOL_APPROVAL_TIMEOUT_MS = parseInt(process.env.CLAUDE_TOOL_APPROVAL_TIMEO
 // new turn supersedes the previous hold. This ceiling only catches background work
 // that never reports at all, so an abandoned session cannot leak a CLI process
 // forever. The timer resets on every message, so it measures silence, not total time.
-const BG_WAIT_CEILING_MS = 30 * 60 * 1000;
+// hq fork: overridable with CLOUDCLI_BG_WAIT_CEILING_MS, validated in claude-hold-ceilings.
+const BG_WAIT_CEILING_MS = HELD_BG_WAIT_CEILING_MS;
 
 // How long a turn that ended with steered messages still unread waits for the
 // follow-up turn the CLI runs them in, before giving up and ending the run.
