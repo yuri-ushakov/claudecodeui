@@ -103,8 +103,11 @@ export function endsTurn(message: AnyRecord | null | undefined) {
 /** Held sessions by session key. */
 const heldSessions = new Map<string, HeldClaudeSession>();
 
-/** How long a session may sit idle, with nothing outstanding, before its process is let go. */
-const DEFAULT_IDLE_MS = 10 * 60 * 1000;
+/**
+ * How long a session may sit idle, with nothing outstanding, before its process is let go.
+ * hq fork: overridable with CLOUDCLI_HELD_IDLE_MS (milliseconds).
+ */
+const DEFAULT_IDLE_MS = parseInt(process.env.CLOUDCLI_HELD_IDLE_MS ?? '', 10) || 10 * 60 * 1000;
 
 /**
  * How long a process gets to exit on its own after its stdin was ended before
@@ -623,9 +626,13 @@ export class HeldClaudeSession {
     if (this.closed) {
       return;
     }
-    const delay = this.turn?.isHoldingForBackgroundWork?.() ? this.backgroundWorkCeilingMs : this.idleMs;
+    const holding = Boolean(this.turn?.isHoldingForBackgroundWork?.());
+    const delay = holding ? this.backgroundWorkCeilingMs : this.idleMs;
     this.idleTimer = setTimeout(() => {
       this.idleTimer = null;
+      // hq fork: the release used to be silent, which made lost background waits look like
+      // unexplained session restarts (hq-cloudcli-idle-release-kills-waiting-agents).
+      console.log(`[Claude SDK] held released: session=${this.sessionKey} reason=${holding ? 'background-ceiling' : 'idle'} silenceMs=${delay}`);
       this.close();
     }, delay);
     // A held process must never be the reason the server cannot exit.
