@@ -1,4 +1,5 @@
 import type { AnyRecord, ProviderRuntimeContext } from '@/shared/types.js';
+import { HELD_IDLE_MS } from './claude-hold-ceilings.js';
 
 /**
  * A Claude CLI process kept alive across the turns of one conversation.
@@ -103,11 +104,8 @@ export function endsTurn(message: AnyRecord | null | undefined) {
 /** Held sessions by session key. */
 const heldSessions = new Map<string, HeldClaudeSession>();
 
-/**
- * How long a session may sit idle, with nothing outstanding, before its process is let go.
- * hq fork: overridable with CLOUDCLI_HELD_IDLE_MS (milliseconds).
- */
-const DEFAULT_IDLE_MS = parseInt(process.env.CLOUDCLI_HELD_IDLE_MS ?? '', 10) || 10 * 60 * 1000;
+/** How long a session may sit idle, with nothing outstanding, before its process is let go (hq fork: see claude-hold-ceilings). */
+const DEFAULT_IDLE_MS = HELD_IDLE_MS;
 
 /**
  * How long a process gets to exit on its own after its stdin was ended before
